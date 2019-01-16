@@ -1130,3 +1130,9 @@ MACHINE_HOSTNAME = socket.gethostname().split(".")[0]
 ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
 
 MAILROOM_URL = ""
+
+try:
+    from temba.settings_local import *
+except ImportError as e:
+    print(e)
+    pass
