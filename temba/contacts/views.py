@@ -115,9 +115,9 @@ class ContactGroupForm(forms.ModelForm):
         if groups_count >= ContactGroup.MAX_ORG_CONTACTGROUPS:
             raise forms.ValidationError(
                 _(
-                    "This org has %s groups and the limit is %s. "
+                    "This org has %(count)d groups and the limit is %(limit)d. "
                     "You must delete existing ones before you can "
-                    "create new ones." % (groups_count, ContactGroup.MAX_ORG_CONTACTGROUPS)
+                    "create new ones." % dict(count=groups_count, limit=ContactGroup.MAX_ORG_CONTACTGROUPS)
                 )
             )
 
@@ -146,7 +146,7 @@ class ContactGroupForm(forms.ModelForm):
             raise forms.ValidationError(str(e))
 
     class Meta:
-        fields = "__all__"
+        fields = ("name", "query")
         model = ContactGroup
 
 
@@ -661,10 +661,10 @@ class ContactCRUDL(SmartCRUDL):
                         if existing_key and existing_key in Contact.RESERVED_FIELD_KEYS:
                             raise forms.ValidationError(
                                 _(
-                                    "'%s' contact field has '%s' key which is reserved name. "
+                                    "'%(label)s' contact field has '%(key)s' key which is reserved name. "
                                     "Column cannot be imported"
                                 )
-                                % (value, existing_key)
+                                % dict(label=value, key=existing_key)
                             )
 
                         used_labels.append(field_label)
@@ -852,9 +852,9 @@ class ContactCRUDL(SmartCRUDL):
                 if groups_count >= ContactGroup.MAX_ORG_CONTACTGROUPS:
                     raise forms.ValidationError(
                         _(
-                            "This org has %s groups and the limit is %s. "
+                            "This org has %(count)d groups and the limit is %(limit)d. "
                             "You must delete existing ones before you can "
-                            "create new ones." % (groups_count, ContactGroup.MAX_ORG_CONTACTGROUPS)
+                            "create new ones." % dict(count=groups_count, limit=ContactGroup.MAX_ORG_CONTACTGROUPS)
                         )
                     )
 
@@ -1591,7 +1591,11 @@ class ContactGroupCRUDL(SmartCRUDL):
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
-            context["triggers"] = self.get_object().trigger_set.filter(is_archived=False)
+            group = self.get_object()
+
+            context["triggers"] = group.trigger_set.filter(is_archived=False)
+            context["campaigns"] = group.campaign_set.filter(is_archived=False)
+
             return context
 
         def get_success_url(self):
@@ -1606,10 +1610,14 @@ class ContactGroupCRUDL(SmartCRUDL):
             triggers = group.trigger_set.filter(is_archived=False)
             if triggers.count() > 0:
                 return HttpResponseRedirect(smart_url(self.cancel_url, group))
+
             from temba.flows.models import Flow
 
             flows = Flow.objects.filter(org=group.org, group_dependencies__in=[group])
             if flows.count():
+                return HttpResponseRedirect(smart_url(self.cancel_url, group))
+
+            if group.campaign_set.filter(is_archived=False).exists():
                 return HttpResponseRedirect(smart_url(self.cancel_url, group))
 
             # deactivate the group, this makes it 'invisible'
@@ -1661,8 +1669,8 @@ class ManageFieldsForm(forms.Form):
                     if flow:
                         raise forms.ValidationError(
                             _(
-                                'The field "%s" cannot be removed while it is still used in the flow "%s"'
-                                % (field.label, flow.name)
+                                'The field "%(label)s" cannot be removed while it is still used in the flow "%(flow)s"'
+                                % dict(label=field.label, flow=flow.name)
                             )
                         )
 
