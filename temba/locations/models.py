@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # default manager for AdminBoundary, doesn't load geometries
 class NoGeometryManager(models.Manager):
     def get_queryset(self):
-        return super().get_queryset().defer("geometry", "simplified_geometry")
+        return super().get_queryset().defer("simplified_geometry")
 
 
 # optional 'geometries' manager for AdminBoundary, loads everything
@@ -60,8 +60,6 @@ class AdminBoundary(MPTTModel, models.Model):
 
     path = models.CharField(max_length=768, help_text="The full path name for this location")
 
-    geometry = models.MultiPolygonField(null=True, help_text="The full geometry of this administrative boundary")
-
     simplified_geometry = models.MultiPolygonField(
         null=True, help_text="The simplified geometry of this administrative boundary"
     )
@@ -70,18 +68,18 @@ class AdminBoundary(MPTTModel, models.Model):
     geometries = GeometryManager()
 
     @staticmethod
-    def get_geojson_dump(features):
+    def get_geojson_dump(name, features):
         # build a feature collection
         feature_collection = geojson.FeatureCollection(features)
-        return geojson.dumps(feature_collection)
+        return geojson.dumps({"name": name, "geometry": feature_collection})
 
-    def as_json(self):
-        result = dict(osm_id=self.osm_id, name=self.name, level=self.level, aliases="")
+    def as_json(self, org):
+        result = dict(osm_id=self.osm_id, name=self.name, level=self.level, aliases="", path=self.path)
 
         if self.parent:
             result["parent_osm_id"] = self.parent.osm_id
 
-        aliases = "\n".join([alias.name for alias in self.aliases.all()])
+        aliases = "\n".join(sorted([alias.name for alias in self.aliases.filter(org=org)]))
         result["aliases"] = aliases
         return result
 
@@ -93,13 +91,13 @@ class AdminBoundary(MPTTModel, models.Model):
         )
 
     def get_geojson(self):
-        return AdminBoundary.get_geojson_dump([self.get_geojson_feature()])
+        return AdminBoundary.get_geojson_dump(self.name, [self.get_geojson_feature()])
 
     def get_children_geojson(self):
         children = []
         for child in self.children.all():
             children.append(child.get_geojson_feature())
-        return AdminBoundary.get_geojson_dump(children)
+        return AdminBoundary.get_geojson_dump(self.name, children)
 
     def update(self, **kwargs):
         AdminBoundary.objects.filter(id=self.id).update(**kwargs)
@@ -124,9 +122,10 @@ class AdminBoundary(MPTTModel, models.Model):
         _update_child_paths(self)
 
     def release(self):
-        for child_boundary in AdminBoundary.objects.filter(parent=self):
+        for child_boundary in AdminBoundary.objects.filter(parent=self):  # pragma: no cover
             child_boundary.release()
 
+        self.aliases.all().delete()
         self.delete()
 
     @classmethod

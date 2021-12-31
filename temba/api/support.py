@@ -1,7 +1,7 @@
 import logging
 
 from rest_framework import exceptions, status
-from rest_framework.authentication import BasicAuthentication, TokenAuthentication
+from rest_framework.authentication import BasicAuthentication, SessionAuthentication, TokenAuthentication
 from rest_framework.exceptions import APIException
 from rest_framework.renderers import BrowsableAPIRenderer
 from rest_framework.throttling import ScopedRateThrottle
@@ -35,6 +35,7 @@ class APITokenAuthentication(TokenAuthentication):
         if token.user.is_active:
             # set the org on this user
             token.user.set_org(token.org)
+            token.user.using_token = True
 
             return token.user, token
 
@@ -62,23 +63,42 @@ class APIBasicAuthentication(BasicAuthentication):
         if token.user.is_active:
             # set the org on this user
             token.user.set_org(token.org)
+            token.user.using_token = True
 
             return token.user, token
 
         raise exceptions.AuthenticationFailed("Invalid token or email")
 
 
-class OrgRateThrottle(ScopedRateThrottle):
+class APISessionAuthentication(SessionAuthentication):
     """
-    Throttle class which rate limits across an org
+    Session authentication as used by the editor, explorer
     """
+
+    def authenticate(self, request):
+        result = super().authenticate(request)
+        if result:
+            result[0].using_token = False
+        return result
+
+
+class OrgUserRateThrottle(ScopedRateThrottle):
+    """
+    Throttle class which rate limits a user in an org
+    """
+
+    def allow_request(self, request, view):
+        # any request not using a token (e.g. editor, explorer) isn't subject to throttling
+        if request.user.is_authenticated and not request.user.using_token:
+            return True
+
+        return super().allow_request(request, view)
 
     def get_cache_key(self, request, view):
         ident = None
         if request.user.is_authenticated:
             org = request.user.get_org()
-            if org:
-                ident = org.pk
+            ident = f"{org.id if org else 0}-{request.user.id}"
 
         return self.cache_format % {"scope": self.scope, "ident": ident or self.get_ident(request)}
 
@@ -113,10 +133,7 @@ class DocumentationRenderer(BrowsableAPIRenderer):
         if not renderer_context:  # pragma: needs cover
             raise ValueError("Can't render without context")
 
-        request_path = renderer_context["request"].path
-        api_version = 1 if request_path.startswith("/api/v1") else 2
-
-        self.template = "api/v%d/api_root.html" % api_version
+        self.template = "api/v2/api_root.html"
 
         return super().render(data, accepted_media_type, renderer_context)
 

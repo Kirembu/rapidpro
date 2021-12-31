@@ -1,4 +1,5 @@
 import gc
+import logging
 import os
 import time
 from datetime import datetime, timedelta
@@ -14,9 +15,10 @@ from django.utils.translation import ugettext_lazy as _
 from temba.assets.models import BaseAssetStore, get_asset_store
 
 from . import analytics
-from .email import send_template_email
 from .models import TembaModel
 from .text import clean_string
+
+logger = logging.getLogger(__name__)
 
 
 class BaseExportAssetStore(BaseAssetStore):
@@ -31,6 +33,7 @@ class BaseExportTask(TembaModel):
 
     analytics_key = None
     asset_type = None
+    notification_export_type = None
 
     MAX_EXCEL_ROWS = 1_048_576
     MAX_EXCEL_COLS = 16384
@@ -64,8 +67,11 @@ class BaseExportTask(TembaModel):
         Performs the actual export. If export generation throws an exception it's caught here and the task is marked
         as failed.
         """
+        from temba.notifications.models import Notification
+
         try:
             self.update_status(self.STATUS_PROCESSING)
+
             print(f"Started perfoming {self.analytics_key} with ID {self.id}")
 
             start = time.time()
@@ -73,17 +79,6 @@ class BaseExportTask(TembaModel):
             temp_file, extension = self.write_export()
 
             get_asset_store(model=self.__class__).save(self.id, File(temp_file), extension)
-
-            branding = self.org.get_branding()
-
-            # notify user who requested this export
-            send_template_email(
-                self.created_by.username,
-                self.email_subject,
-                self.email_template,
-                self.get_email_context(branding),
-                branding,
-            )
 
             # remove temporary file
             if hasattr(temp_file, "delete"):
@@ -93,9 +88,7 @@ class BaseExportTask(TembaModel):
                 os.unlink(temp_file.name)
 
         except Exception as e:
-            import traceback
-
-            traceback.print_exc()
+            logger.error(f"Unable to perform export: {str(e)}", exc_info=True)
             self.update_status(self.STATUS_FAILED)
             print(f"Failed to complete {self.analytics_key} with ID {self.id}")
 
@@ -103,10 +96,10 @@ class BaseExportTask(TembaModel):
         else:
             self.update_status(self.STATUS_COMPLETE)
             elapsed = time.time() - start
-            print(f"Completed {self.analytics_key} in {elapsed:.1f} seconds")
-            analytics.track(
-                self.created_by.username, "temba.%s_latency" % self.analytics_key, properties=dict(value=elapsed)
-            )
+            print(f"Completed {self.analytics_key} with ID {self.id} in {elapsed:.1f} seconds")
+            analytics.track(self.created_by, "temba.%s_latency" % self.analytics_key, properties=dict(value=elapsed))
+
+            Notification.export_finished(self)
         finally:
             gc.collect()  # force garbage collection
 
@@ -118,22 +111,24 @@ class BaseExportTask(TembaModel):
 
     def update_status(self, status):
         self.status = status
-        self.save(update_fields=("status",))
+        self.save(update_fields=("status", "modified_on"))
+
+    @classmethod
+    def get_unfinished(cls):
+        """
+        Returns all unfinished exports
+        """
+        return cls.objects.filter(status__in=(cls.STATUS_PENDING, cls.STATUS_PROCESSING))
 
     @classmethod
     def get_recent_unfinished(cls, org):
         """
-        Checks for unfinished exports created in the last 24 hours for this org, and returns the most recent
+        Checks for unfinished exports created in the last 4 hours for this org, and returns the most recent
         """
-        return (
-            cls.objects.filter(
-                org=org,
-                created_on__gt=timezone.now() - timedelta(hours=24),
-                status__in=(cls.STATUS_PENDING, cls.STATUS_PROCESSING),
-            )
-            .order_by("-created_on")
-            .first()
-        )
+
+        day_ago = timezone.now() - timedelta(hours=4)
+
+        return cls.get_unfinished().filter(org=org, created_on__gt=day_ago).order_by("created_on").last()
 
     def append_row(self, sheet, values):
         sheet.append_row(*[self.prepare_value(v) for v in values])
@@ -152,10 +147,12 @@ class BaseExportTask(TembaModel):
         else:
             return clean_string(str(value))
 
-    def get_email_context(self, branding):
+    def get_download_url(self) -> str:
         asset_store = get_asset_store(model=self.__class__)
+        return asset_store.get_asset_url(self.id)
 
-        return {"link": branding["link"] + asset_store.get_asset_url(self.id)}
+    def get_notification_scope(self) -> str:
+        return f"{self.notification_export_type}:{self.id}"
 
     class Meta:
         abstract = True

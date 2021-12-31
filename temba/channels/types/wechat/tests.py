@@ -4,11 +4,10 @@ from django.test import override_settings
 from django.urls import reverse
 
 from temba.channels.types.wechat.tasks import refresh_wechat_access_tokens
-from temba.contacts.models import URN
 from temba.tests import MockResponse, TembaTest
-from temba.utils.wechat import WeChatClient
 
 from ...models import Channel, ChannelLog
+from .client import WeChatClient
 
 
 class WeChatTypeTest(TembaTest):
@@ -54,7 +53,7 @@ class WeChatTypeTest(TembaTest):
         self.assertContains(response, "10.10.10.10")
         self.assertContains(response, "172.16.20.30")
 
-        contact = self.create_contact("WeChat User", urn=URN.from_wechat("1234"))
+        contact = self.create_contact("WeChat User", urns=["wechat:1234"])
 
         # make sure we our jiochat channel satisfies as a send channel
         response = self.client.get(reverse("contacts.contact_read", args=[contact.uuid]))
@@ -117,9 +116,7 @@ class WeChatTypeTest(TembaTest):
             {"secret": "app-secret", "grant_type": "client_credential", "appid": "app-id"},
         )
         self.login(self.admin)
-        response = self.client.get(
-            reverse("channels.channellog_list") + "?channel=%d&others=1" % channel.id, follow=True
-        )
+        response = self.client.get(reverse("channels.channellog_list", args=[channel.uuid]) + "?others=1", follow=True)
         self.assertEqual(len(response.context["object_list"]), 3)
 
         mock_get.reset_mock()

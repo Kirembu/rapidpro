@@ -5,23 +5,47 @@ import iso8601
 import pytz
 
 from django.conf import settings
+from django.contrib.auth.models import User
 from django.utils import timezone
 
-from celery.task import task
+from celery import shared_task
 
-from temba.utils.queues import nonoverlapping_task
+from temba.utils import chunk_list
+from temba.utils.celery import nonoverlapping_task
 
-from .models import Contact, ContactGroup, ContactGroupCount, ExportContactsTask
+from .models import Contact, ContactGroup, ContactGroupCount, ContactImport, ExportContactsTask
+from .search import elastic
 
 logger = logging.getLogger(__name__)
 
 
-@task(track_started=True, name="export_contacts_task")
+@shared_task(track_started=True)
+def release_contacts(user_id, contact_ids):
+    """
+    Releases the given contacts
+    """
+    user = User.objects.get(pk=user_id)
+
+    for id_batch in chunk_list(contact_ids, 100):
+        batch = Contact.objects.filter(id__in=id_batch, is_active=True).prefetch_related("urns")
+        for contact in batch:
+            contact.release(user)
+
+
+@shared_task(track_started=True)
+def import_contacts_task(import_id):
+    """
+    Import contacts from a spreadsheet
+    """
+    ContactImport.objects.select_related("org", "created_by").get(id=import_id).start()
+
+
+@shared_task(track_started=True, name="export_contacts_task")
 def export_contacts_task(task_id):
     """
     Export contacts to a file and e-mail a link to the user
     """
-    ExportContactsTask.objects.get(id=task_id).perform()
+    ExportContactsTask.objects.select_related("org", "created_by").get(id=task_id).perform()
 
 
 @nonoverlapping_task(track_started=True, name="release_group_task")
@@ -29,7 +53,7 @@ def release_group_task(group_id):
     """
     Releases group
     """
-    ContactGroup.all_groups.get(id=group_id).release()
+    ContactGroup.all_groups.get(id=group_id)._full_release()
 
 
 @nonoverlapping_task(track_started=True, name="squash_contactgroupcounts", lock_timeout=7200)
@@ -40,15 +64,7 @@ def squash_contactgroupcounts():
     ContactGroupCount.squash()
 
 
-@task(track_started=True, name="reevaluate_dynamic_group")
-def reevaluate_dynamic_group(group_id):
-    """
-    (Re)evaluate a dynamic group
-    """
-    ContactGroup.user_groups.get(id=group_id).reevaluate()
-
-
-@task(track_started=True, name="full_release_contact")
+@shared_task(track_started=True, name="full_release_contact")
 def full_release_contact(contact_id):
     contact = Contact.objects.filter(id=contact_id).first()
 
@@ -56,27 +72,16 @@ def full_release_contact(contact_id):
         contact._full_release()
 
 
-@task(name="check_elasticsearch_lag")
+@shared_task(name="check_elasticsearch_lag")
 def check_elasticsearch_lag():
     if settings.ELASTICSEARCH_URL:
-        from temba.utils.es import ES, ModelESSearch
+        es_last_modified_contact = elastic.get_last_modified()
 
-        # get the modified_on of the last synced contact
-        res = (
-            ModelESSearch(model=Contact, index="contacts")
-            .params(size=1)
-            .sort("-modified_on_mu")
-            .source(include=["modified_on", "id"])
-            .using(ES)
-            .execute()
-        )
-
-        es_hits = res["hits"]["hits"]
-        if es_hits:
+        if es_last_modified_contact:
             # if we have elastic results, make sure they aren't more than five minutes behind
-            db_contact = Contact.objects.filter(is_test=False).order_by("-modified_on").first()
-            es_modified_on = iso8601.parse_date(es_hits[0]["_source"]["modified_on"], pytz.utc)
-            es_id = es_hits[0]["_source"]["id"]
+            db_contact = Contact.objects.order_by("-modified_on").first()
+            es_modified_on = iso8601.parse_date(es_last_modified_contact["modified_on"], pytz.utc)
+            es_id = es_last_modified_contact["id"]
 
             # no db contact is an error, ES should be empty as well
             if not db_contact:
@@ -101,7 +106,7 @@ def check_elasticsearch_lag():
 
         else:
             # we don't have any ES hits, get our oldest db contact, check it is less than five minutes old
-            db_contact = Contact.objects.filter(is_test=False).order_by("modified_on").first()
+            db_contact = Contact.objects.order_by("modified_on").first()
             if db_contact and timezone.now() - db_contact.modified_on > timedelta(minutes=5):
                 logger.error(
                     "ElasticSearch empty with DB contacts older than five minutes. Oldest DB(id: %d, modified_on: %s)",

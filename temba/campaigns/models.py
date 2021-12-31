@@ -1,26 +1,31 @@
-from datetime import timedelta
+from typing import List
 
 from django.db import models
 from django.db.models import Model
 from django.utils import timezone
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import ngettext, ugettext_lazy as _
 
+from temba import mailroom
 from temba.contacts.models import Contact, ContactField, ContactGroup
-from temba.flows.models import Flow, FlowStart
+from temba.flows.models import Flow
 from temba.msgs.models import Msg
 from temba.orgs.models import Org
 from temba.utils import json, on_transaction_commit
 from temba.utils.models import TembaModel, TranslatableField
-from temba.values.constants import Value
 
 
 class Campaign(TembaModel):
     MAX_NAME_LEN = 255
 
-    name = models.CharField(max_length=MAX_NAME_LEN, help_text="The name of this campaign")
-    group = models.ForeignKey(ContactGroup, on_delete=models.PROTECT, help_text="The group this campaign operates on")
-    is_archived = models.BooleanField(default=False, help_text="Whether this campaign is archived or not")
-    org = models.ForeignKey(Org, on_delete=models.PROTECT, help_text="The organization this campaign exists for")
+    EXPORT_UUID = "uuid"
+    EXPORT_NAME = "name"
+    EXPORT_GROUP = "group"
+    EXPORT_EVENTS = "events"
+
+    org = models.ForeignKey(Org, related_name="campaigns", on_delete=models.PROTECT)
+    name = models.CharField(max_length=MAX_NAME_LEN)
+    group = models.ForeignKey(ContactGroup, on_delete=models.PROTECT, related_name="campaigns")
+    is_archived = models.BooleanField(default=False)
 
     @classmethod
     def create(cls, org, user, name, group):
@@ -47,156 +52,164 @@ class Campaign(TembaModel):
 
         return name
 
+    def recreate_events(self):
+        """
+        Recreates all the events in this campaign - called when something like the group changes.
+        """
+
+        for event in self.get_events():
+            event.recreate()
+
+    def schedule_events_async(self):
+        """
+        Schedules all the events in this campaign - called when something like the group changes.
+        """
+
+        for event in self.get_events():
+            event.schedule_async()
+
     @classmethod
-    def import_campaigns(cls, exported_json, org, user, same_site=False):
+    def import_campaigns(cls, org, user, campaign_defs, same_site=False) -> List:
         """
-        Import campaigns from our export file
+        Import campaigns from a list of exported campaigns
         """
-        from temba.orgs.models import EARLIEST_IMPORT_VERSION
 
-        if Flow.is_before_version(exported_json.get("version", "0"), EARLIEST_IMPORT_VERSION):  # pragma: needs cover
-            raise ValueError(_("Unknown version (%s)" % exported_json.get("version", 0)))
+        imported = []
 
-        if "campaigns" in exported_json:
-            for campaign_spec in exported_json["campaigns"]:
-                name = campaign_spec["name"]
-                campaign = None
-                group = None
+        for campaign_def in campaign_defs:
+            name = campaign_def[Campaign.EXPORT_NAME]
+            campaign = None
+            group = None
 
-                # first check if we have the objects by id
-                if same_site:
-                    group = ContactGroup.user_groups.filter(uuid=campaign_spec["group"]["uuid"], org=org).first()
-                    if group:  # pragma: needs cover
-                        group.name = campaign_spec["group"]["name"]
-                        group.save()
+            # first check if we have the objects by UUID
+            if same_site:
+                group = ContactGroup.user_groups.filter(
+                    uuid=campaign_def[Campaign.EXPORT_GROUP]["uuid"], org=org
+                ).first()
+                if group:  # pragma: needs cover
+                    group.name = campaign_def[Campaign.EXPORT_GROUP]["name"]
+                    group.save()
 
-                    campaign = Campaign.objects.filter(org=org, uuid=campaign_spec["uuid"]).first()
-                    if campaign:  # pragma: needs cover
-                        campaign.name = Campaign.get_unique_name(org, name, ignore=campaign)
-                        campaign.save()
-
-                # fall back to lookups by name
-                if not group:
-                    group = ContactGroup.get_user_group(org, campaign_spec["group"]["name"])
-
-                if not campaign:
-                    campaign = Campaign.objects.filter(org=org, name=name).first()
-
-                # all else fails, create the objects from scratch
-                if not group:
-                    group = ContactGroup.create_static(org, user, campaign_spec["group"]["name"])
-
-                if not campaign:
-                    campaign_name = Campaign.get_unique_name(org, name)
-                    campaign = Campaign.create(org, user, campaign_name, group)
-                else:
-                    campaign.group = group
+                campaign = Campaign.objects.filter(org=org, uuid=campaign_def[Campaign.EXPORT_UUID]).first()
+                if campaign:  # pragma: needs cover
+                    campaign.name = Campaign.get_unique_name(org, name, ignore=campaign)
                     campaign.save()
 
-                # deactivate all of our events, we'll recreate these
-                for event in campaign.events.all():
-                    event.release()
+            # fall back to lookups by name
+            if not group:
+                group = ContactGroup.get_user_group_by_name(org, campaign_def[Campaign.EXPORT_GROUP]["name"])
 
-                # fill our campaign with events
-                for event_spec in campaign_spec["events"]:
-                    field_key = event_spec["relative_to"]["key"]
+            if not campaign:
+                campaign = Campaign.objects.filter(org=org, name=name).first()
 
-                    if field_key == "created_on":
-                        relative_to = ContactField.system_fields.filter(org=org, key=field_key).first()
-                    else:
-                        relative_to = ContactField.get_or_create(
-                            org, user, key=field_key, label=event_spec["relative_to"]["label"], value_type="D"
-                        )
+            # all else fails, create the objects from scratch
+            if not group:
+                group = ContactGroup.create_static(org, user, campaign_def[Campaign.EXPORT_GROUP]["name"])
 
-                    start_mode = event_spec.get("start_mode", CampaignEvent.MODE_INTERRUPT)
+            if not campaign:
+                campaign_name = Campaign.get_unique_name(org, name)
+                campaign = Campaign.create(org, user, campaign_name, group)
+            else:
+                campaign.group = group
+                campaign.save()
 
-                    # create our message flow for message events
-                    if event_spec["event_type"] == CampaignEvent.TYPE_MESSAGE:
+            # deactivate all of our events, we'll recreate these
+            for event in campaign.events.all():
+                event.release(user)
 
-                        message = event_spec["message"]
-                        base_language = event_spec.get("base_language")
+            # fill our campaign with events
+            for event_spec in campaign_def[Campaign.EXPORT_EVENTS]:
+                field_key = event_spec["relative_to"]["key"]
 
-                        if not isinstance(message, dict):
-                            try:
-                                message = json.loads(message)
-                            except ValueError:
-                                # if it's not a language dict, turn it into one
-                                message = dict(base=message)
-                                base_language = "base"
+                if field_key == "created_on":
+                    relative_to = ContactField.system_fields.filter(org=org, key=field_key).first()
+                else:
+                    relative_to = ContactField.get_or_create(
+                        org, user, key=field_key, label=event_spec["relative_to"]["label"], value_type="D"
+                    )
 
-                        event = CampaignEvent.create_message_event(
+                start_mode = event_spec.get("start_mode", CampaignEvent.MODE_INTERRUPT)
+
+                # create our message flow for message events
+                if event_spec["event_type"] == CampaignEvent.TYPE_MESSAGE:
+
+                    message = event_spec["message"]
+                    base_language = event_spec.get("base_language")
+
+                    if not isinstance(message, dict):
+                        try:
+                            message = json.loads(message)
+                        except ValueError:
+                            # if it's not a language dict, turn it into one
+                            message = dict(base=message)
+                            base_language = "base"
+
+                    event = CampaignEvent.create_message_event(
+                        org,
+                        user,
+                        campaign,
+                        relative_to,
+                        event_spec["offset"],
+                        event_spec["unit"],
+                        message,
+                        event_spec["delivery_hour"],
+                        base_language=base_language,
+                        start_mode=start_mode,
+                    )
+                    event.update_flow_name()
+                else:
+                    flow = Flow.objects.filter(
+                        org=org, is_active=True, is_system=False, uuid=event_spec["flow"]["uuid"]
+                    ).first()
+                    if flow:
+                        CampaignEvent.create_flow_event(
                             org,
                             user,
                             campaign,
                             relative_to,
                             event_spec["offset"],
                             event_spec["unit"],
-                            message,
+                            flow,
                             event_spec["delivery_hour"],
-                            base_language=base_language,
                             start_mode=start_mode,
                         )
-                        event.update_flow_name()
-                    else:
-                        flow = Flow.objects.filter(
-                            org=org, is_active=True, is_system=False, uuid=event_spec["flow"]["uuid"]
-                        ).first()
-                        if flow:
-                            CampaignEvent.create_flow_event(
-                                org,
-                                user,
-                                campaign,
-                                relative_to,
-                                event_spec["offset"],
-                                event_spec["unit"],
-                                flow,
-                                event_spec["delivery_hour"],
-                                start_mode=start_mode,
-                            )
 
-                # update our scheduled events for this campaign
-                EventFire.update_campaign_events(campaign)
+            imported.append(campaign)
 
-    @classmethod
-    def restore_flows(cls, campaign):
-        events = (
-            campaign.events.filter(is_active=True, event_type=CampaignEvent.TYPE_FLOW)
-            .exclude(flow=None)
-            .select_related("flow")
-        )
-        for event in events:
-            event.flow.restore()
+        return imported
 
     @classmethod
     def apply_action_archive(cls, user, campaigns):
         campaigns.update(is_archived=True, modified_by=user, modified_on=timezone.now())
 
-        # update the events for each campaign
+        # recreate events so existing event fires will be ignored
         for campaign in campaigns:
-            EventFire.update_campaign_events(campaign)
-
-        return [each_campaign.pk for each_campaign in campaigns]
+            campaign.recreate_events()
 
     @classmethod
     def apply_action_restore(cls, user, campaigns):
         campaigns.update(is_archived=False, modified_by=user, modified_on=timezone.now())
 
-        # update the events for each campaign
         for campaign in campaigns:
-            Campaign.restore_flows(campaign)
-            EventFire.update_campaign_events(campaign)
+            # for any flow events, ensure flows are restored as well
+            events = (
+                campaign.events.filter(is_active=True, event_type=CampaignEvent.TYPE_FLOW)
+                .exclude(flow=None)
+                .select_related("flow")
+            )
+            for event in events:
+                event.flow.restore(user)
 
-        return [each_campaign.pk for each_campaign in campaigns]
+            campaign.schedule_events_async()
 
     def get_events(self):
-        return self.events.filter(is_active=True).order_by("relative_to", "offset")
+        return self.events.filter(is_active=True).order_by("id")
 
-    def as_json(self):
+    def as_export_def(self):
         """
-        A json representation of this event, suitable for export. Note this only returns the ids and names
-        of the dependent flows. You will want to export these flows seperately using get_all_flows()
+        The definition of this campaign for export. Note this only includes references to the dependent
+        flows which will be exported separately.
         """
-        definition = dict(name=self.name, uuid=self.uuid, group=dict(uuid=self.group.uuid, name=self.group.name))
         events = []
 
         for event in self.events.filter(is_active=True).order_by("flow__uuid"):
@@ -207,13 +220,13 @@ class Campaign(TembaModel):
                 event_type=event.event_type,
                 delivery_hour=event.delivery_hour,
                 message=event.message,
-                relative_to=dict(label=event.relative_to.label, key=event.relative_to.key),
+                relative_to=dict(label=event.relative_to.label, key=event.relative_to.key),  # TODO should be key/name
                 start_mode=event.start_mode,
             )
 
             # only include the flow definition for standalone flows
             if event.event_type == CampaignEvent.TYPE_FLOW:
-                event_definition["flow"] = dict(uuid=event.flow.uuid, name=event.flow.name)
+                event_definition["flow"] = event.flow.as_export_ref()
 
             # include the flow base language for message flows
             elif event.event_type == CampaignEvent.TYPE_MESSAGE:
@@ -221,8 +234,12 @@ class Campaign(TembaModel):
 
             events.append(event_definition)
 
-        definition["events"] = events
-        return definition
+        return {
+            Campaign.EXPORT_UUID: str(self.uuid),
+            Campaign.EXPORT_NAME: self.name,
+            Campaign.EXPORT_GROUP: self.group.as_export_ref(),
+            Campaign.EXPORT_EVENTS: events,
+        }
 
     def get_sorted_events(self):
         """
@@ -236,8 +253,21 @@ class Campaign(TembaModel):
 
         return sorted(events, key=lambda e: e.relative_to.pk * 100_000 + e.minute_offset())
 
+    def delete(self):
+        """
+        Deletes this campaign completely
+        """
+        for event in self.events.all():
+            event.delete()
+
+        super().delete()
+
     def __str__(self):
-        return self.name
+        return f'Campaign[uuid={self.uuid}, name="{self.name}"]'
+
+    class Meta:
+        verbose_name = _("Campaign")
+        verbose_name_plural = _("Campaigns")
 
 
 class CampaignEvent(TembaModel):
@@ -249,7 +279,7 @@ class CampaignEvent(TembaModel):
     TYPE_MESSAGE = "M"
 
     # single char flag, human readable name, API readable name
-    TYPE_CONFIG = ((TYPE_FLOW, _("Flow Event"), "flow"), (TYPE_MESSAGE, _("Message Event"), "message"))
+    TYPE_CONFIG = ((TYPE_FLOW, "Flow Event", "flow"), (TYPE_MESSAGE, "Message Event", "message"))
 
     TYPE_CHOICES = [(t[0], t[1]) for t in TYPE_CONFIG]
 
@@ -271,40 +301,32 @@ class CampaignEvent(TembaModel):
     MODE_SKIP = "S"
     MODE_PASSIVE = "P"
 
-    START_MODES_CHOICES = ((MODE_INTERRUPT, _("Interrupt")), (MODE_SKIP, _("Skip")), (MODE_PASSIVE, _("Passive")))
+    START_MODES_CHOICES = ((MODE_INTERRUPT, "Interrupt"), (MODE_SKIP, "Skip"), (MODE_PASSIVE, "Passive"))
 
-    campaign = models.ForeignKey(
-        Campaign, on_delete=models.PROTECT, related_name="events", help_text="The campaign this event is part of"
-    )
-    offset = models.IntegerField(
-        default=0, help_text="The offset in days from our date (positive is after, negative is before)"
-    )
-    unit = models.CharField(
-        max_length=1, choices=UNIT_CHOICES, default=UNIT_DAYS, help_text="The unit for the offset for this event"
-    )
-    relative_to = models.ForeignKey(
-        ContactField,
-        on_delete=models.PROTECT,
-        related_name="campaigns",
-        help_text="The field our offset is relative to",
-    )
+    campaign = models.ForeignKey(Campaign, on_delete=models.PROTECT, related_name="events")
 
-    flow = models.ForeignKey(
-        Flow, on_delete=models.PROTECT, related_name="events", help_text="The flow that will be triggered"
-    )
+    event_type = models.CharField(max_length=1, choices=TYPE_CHOICES, default=TYPE_FLOW)
 
-    start_mode = models.CharField(
-        max_length=1, choices=START_MODES_CHOICES, default=MODE_INTERRUPT, help_text="The start mode of this event"
-    )
+    # the contact specific date value this is event is based on
+    relative_to = models.ForeignKey(ContactField, on_delete=models.PROTECT, related_name="campaign_events")
 
-    event_type = models.CharField(
-        max_length=1, choices=TYPE_CHOICES, default=TYPE_FLOW, help_text="The type of this event"
-    )
+    # offset from that date value (positive is after, negative is before)
+    offset = models.IntegerField(default=0)
+
+    # the unit for the offset, e.g. days, weeks
+    unit = models.CharField(max_length=1, choices=UNIT_CHOICES, default=UNIT_DAYS)
+
+    # the flow that will be triggered by this event
+    flow = models.ForeignKey(Flow, on_delete=models.PROTECT, related_name="campaign_events")
+
+    # what should happen to other runs when this event is triggered
+    start_mode = models.CharField(max_length=1, choices=START_MODES_CHOICES, default=MODE_INTERRUPT)
 
     # when sending single message events, we store the message here (as well as on the flow) for convenience
     message = TranslatableField(max_length=Msg.MAX_TEXT_LEN, null=True)
 
-    delivery_hour = models.IntegerField(default=-1, help_text="The hour to send the message or flow at.")
+    # can also specify the hour during the day that the even should be triggered
+    delivery_hour = models.IntegerField(default=-1)
 
     @classmethod
     def create_message_event(
@@ -323,13 +345,13 @@ class CampaignEvent(TembaModel):
         if campaign.org != org:
             raise ValueError("Org mismatch")
 
-        if relative_to.value_type != Value.TYPE_DATETIME:
+        if relative_to.value_type != ContactField.TYPE_DATETIME:
             raise ValueError(
                 f"Contact fields for CampaignEvents must have a datetime type, got {relative_to.value_type}."
             )
 
         if isinstance(message, str):
-            base_language = org.primary_language.iso_code if org.primary_language else "base"
+            base_language = org.flow_languages[0] if org.flow_languages else "base"
             message = {base_language: message}
 
         flow = Flow.create_single_message(org, user, message, base_language)
@@ -355,7 +377,7 @@ class CampaignEvent(TembaModel):
         if campaign.org != org:
             raise ValueError("Org mismatch")
 
-        if relative_to.value_type != Value.TYPE_DATETIME:
+        if relative_to.value_type != ContactField.TYPE_DATETIME:
             raise ValueError(
                 f"Contact fields for CampaignEvents must have a datetime type, got '{relative_to.value_type}'."
             )
@@ -386,6 +408,10 @@ class CampaignEvent(TembaModel):
             hours.append((i, "at %s:00 %s" % (hour, period)))
         return hours
 
+    @property
+    def name(self):
+        return f"{self.campaign.name} ({self.offset_display} {self.relative_to.name})"
+
     def get_message(self, contact=None):
         if not self.message:
             return None
@@ -406,14 +432,8 @@ class CampaignEvent(TembaModel):
         if self.event_type != self.TYPE_MESSAGE:
             return
 
-        self.flow.name = "Single Message (%d)" % self.pk
+        self.flow.name = "Single Message (%d)" % self.id
         self.flow.save(update_fields=["name"])
-
-    def single_unit_display(self):
-        return self.get_unit_display()[:-1]
-
-    def abs_offset(self):
-        return abs(self.offset)
 
     def minute_offset(self):
         """
@@ -435,59 +455,43 @@ class CampaignEvent(TembaModel):
 
         return offset
 
-    def calculate_scheduled_fire_for_value(self, date_value, now):
-        tz = self.campaign.org.timezone
+    @property
+    def offset_display(self):
+        """
+        Returns the offset and units as a human readable string
+        """
+        count = abs(self.offset)
+        if self.offset < 0:
+            if self.unit == "M":
+                return ngettext("%d minute before", "%d minutes before", count) % count
+            elif self.unit == "H":
+                return ngettext("%d hour before", "%d hours before", count) % count
+            elif self.unit == "D":
+                return ngettext("%d day before", "%d days before", count) % count
+            elif self.unit == "W":
+                return ngettext("%d week before", "%d weeks before", count) % count
+        elif self.offset > 0:
+            if self.unit == "M":
+                return ngettext("%d minute after", "%d minutes after", count) % count
+            elif self.unit == "H":
+                return ngettext("%d hour after", "%d hours after", count) % count
+            elif self.unit == "D":
+                return ngettext("%d day after", "%d days after", count) % count
+            elif self.unit == "W":
+                return ngettext("%d week after", "%d weeks after", count) % count
+        else:
+            return _("on")
 
-        # nothing to base off of, nothing to fire
-        if not date_value:
-            return None
+    def schedule_async(self):
+        on_transaction_commit(lambda: mailroom.queue_schedule_campaign_event(self))
 
-        # field is no longer active? return
-        if not self.relative_to.is_active:  # pragma: no cover
-            return None
-
-        # convert to our timezone
-        date_value = date_value.astimezone(tz)
-
-        # if we got a date, floor to the minute
-        date_value = date_value.replace(second=0, microsecond=0)
-
-        # try to parse it to a datetime
-        try:
-            if self.unit == CampaignEvent.UNIT_MINUTES:  # pragma: needs cover
-                delta = timedelta(minutes=self.offset)
-            elif self.unit == CampaignEvent.UNIT_HOURS:  # pragma: needs cover
-                delta = timedelta(hours=self.offset)
-            elif self.unit == CampaignEvent.UNIT_DAYS:
-                delta = timedelta(days=self.offset)
-            elif self.unit == CampaignEvent.UNIT_WEEKS:
-                delta = timedelta(weeks=self.offset)
-
-            scheduled = date_value + delta
-
-            # normalize according to our timezone (puts us in the right DST timezone if our date changed)
-            if str(tz) != "UTC":
-                scheduled = tz.normalize(scheduled)
-
-            if self.delivery_hour != -1:
-                scheduled = scheduled.replace(hour=self.delivery_hour, minute=0, second=0, microsecond=0)
-
-            # if we've changed utcoffset (DST shift), tweak accordingly (this keeps us at the same hour of the day)
-            elif str(tz) != "UTC" and date_value.utcoffset() != scheduled.utcoffset():
-                scheduled = tz.normalize(date_value.utcoffset() - scheduled.utcoffset() + scheduled)
-
-            # ignore anything in the past
-            if scheduled > now:
-                return scheduled
-
-        except Exception:  # pragma: no cover
-            pass
-
-        return None  # pragma: no cover
-
-    def deactivate_and_copy(self):
-
-        self.release()
+    def recreate(self):
+        """
+        Cleaning up millions of event fires would be expensive so instead we treat campaign events as immutable objects
+        and when a change is made that would invalidate existing event fires, we deactivate the event and recreate it.
+        The event fire handling code knows to ignore event fires for deactivated event.
+        """
+        self.release(self.created_by)
 
         # clone our event into a new event
         if self.event_type == CampaignEvent.TYPE_FLOW:
@@ -517,60 +521,62 @@ class CampaignEvent(TembaModel):
                 self.start_mode,
             )
 
-    def release(self):
+    def release(self, user):
         """
         Marks the event inactive and releases flows for single message flows
         """
-
         # we need to be inactive so our fires are noops
         self.is_active = False
-        self.save(update_fields=("is_active",))
+        self.modified_by = user
+        self.save(update_fields=("is_active", "modified_by", "modified_on"))
 
         # detach any associated flow starts
         self.flow_starts.all().update(campaign_event=None)
 
         # if flow isn't a user created flow we can delete it too
         if self.event_type == CampaignEvent.TYPE_MESSAGE:
-            self.flow.starts.all().update(is_active=False)
-            self.flow.release()
+            self.flow.release(user)
 
-    def calculate_scheduled_fire(self, contact):
-        return self.calculate_scheduled_fire_for_value(contact.get_field_value(self.relative_to), timezone.now())
+    def delete(self):
+        """
+        Deletes this event completely along with associated fires
+        """
+
+        # delete any associated fires
+        self.fires.all().delete()
+
+        # and ourselves
+        super().delete()
 
     def __str__(self):
-        return "%s == %d -> %s" % (self.relative_to, self.offset, self.flow)
+        return f'Event[relative_to={self.relative_to.key}, offset={self.offset}, flow="{self.flow.name}"]'
+
+    class Meta:
+        verbose_name = _("Campaign Event")
+        verbose_name_plural = _("Campaign Events")
 
 
 class EventFire(Model):
-    FIRED = "F"
-    SKIPPED = "S"
+    """
+    A scheduled firing of a campaign event for a particular contact
+    """
 
-    FIRED_RESULTS_CHOICES = ((FIRED, _("Fired")), (SKIPPED, _("Skipped")))
+    RESULT_FIRED = "F"
+    RESULT_SKIPPED = "S"
+    RESULTS = ((RESULT_FIRED, "Fired"), (RESULT_SKIPPED, "Skipped"))
 
-    event = models.ForeignKey(
-        "campaigns.CampaignEvent",
-        on_delete=models.PROTECT,
-        related_name="event_fires",
-        help_text=_("The event that will be fired"),
-    )
-    contact = models.ForeignKey(
-        Contact,
-        on_delete=models.PROTECT,
-        related_name="fire_events",
-        help_text=_("The contact that is scheduled to have an event run"),
-    )
-    scheduled = models.DateTimeField(help_text=_("When this event is scheduled to run"))
-    fired = models.DateTimeField(
-        null=True, blank=True, help_text=_("When this event actually fired, null if not yet fired")
-    )
+    event = models.ForeignKey(CampaignEvent, on_delete=models.PROTECT, related_name="fires")
 
-    fired_result = models.CharField(
-        max_length=1,
-        choices=FIRED_RESULTS_CHOICES,
-        null=True,
-        blank=True,
-        help_text=_("Whether the event is fired or skipped, null if not yet fired"),
-    )
+    contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="campaign_fires")
+
+    # when the event should be fired for this contact
+    scheduled = models.DateTimeField()
+
+    # when the event was fired fir this contact or null if we haven't been fired
+    fired = models.DateTimeField(null=True)
+
+    # result of this event fire or null if we haven't been fired
+    fired_result = models.CharField(max_length=1, null=True, choices=RESULTS)
 
     def is_firing_soon(self):
         return self.scheduled < timezone.now()
@@ -579,198 +585,8 @@ class EventFire(Model):
         value = self.contact.get_field_value(self.event.relative_to)
         return value.replace(second=0, microsecond=0) if value else None
 
-    @classmethod
-    def batch_fire(cls, fires, flow):
-        """
-        Starts a batch of event fires that are for events which use the same flow
-        """
-        fired = timezone.now()
-        contacts = [f.contact for f in fires]
-        event = fires[0].event
-
-        include_active = not (
-            event.event_type == CampaignEvent.TYPE_MESSAGE and event.start_mode == CampaignEvent.MODE_SKIP
-        )
-        if event.is_active and not event.campaign.is_archived:
-            if len(contacts) == 1:
-                flow.start(
-                    [], contacts, restart_participants=True, include_active=include_active, campaign_event=event
-                )
-            else:
-                start = FlowStart.create(
-                    flow, flow.created_by, contacts=contacts, include_active=include_active, campaign_event=event
-                )
-                start.async_start()
-            EventFire.objects.filter(id__in=[f.id for f in fires]).update(fired=fired)
-        else:
-            EventFire.objects.filter(id__in=[f.id for f in fires]).delete()
-
-    @classmethod
-    def update_campaign_events(cls, campaign):
-        """
-        Updates all the scheduled events for each user for the passed in campaign.
-        Should be called anytime a campaign changes.
-        """
-        for event in campaign.get_events():
-            if EventFire.objects.filter(event=event).exists():
-                event = event.deactivate_and_copy()
-            EventFire.create_eventfires_for_event(event)
-
-    @classmethod
-    def create_eventfires_for_event(cls, event):
-        from temba.campaigns.tasks import create_event_fires
-
-        on_transaction_commit(lambda: create_event_fires.delay(event.pk))
-
-    @classmethod
-    def do_create_eventfires_for_event(cls, event):
-
-        if EventFire.objects.filter(event=event).exists():
-            return
-
-        if event.is_active and not event.campaign.is_archived:
-
-            # create fires for our event
-            field = event.relative_to
-            if field.field_type == ContactField.FIELD_TYPE_USER:
-                field_uuid = str(field.uuid)
-
-                contacts = (
-                    event.campaign.group.contacts.filter(is_active=True, is_blocked=False)
-                    .exclude(is_test=True)
-                    .extra(
-                        where=['%s::text[] <@ (extract_jsonb_keys("contacts_contact"."fields"))'],
-                        params=[[field_uuid]],
-                    )
-                )
-            elif field.field_type == ContactField.FIELD_TYPE_SYSTEM:
-                contacts = event.campaign.group.contacts.filter(is_active=True, is_blocked=False).exclude(is_test=True)
-            else:  # pragma: no cover
-                raise ValueError(f"Unhandled ContactField type {field.field_type}.")
-
-            now = timezone.now()
-            events = []
-
-            org = event.campaign.org
-            for contact in contacts:
-                contact.org = org
-                scheduled = event.calculate_scheduled_fire_for_value(contact.get_field_value(field), now)
-
-                # and if we have a date, then schedule it
-                if scheduled:
-                    events.append(EventFire(event=event, contact=contact, scheduled=scheduled))
-
-            # bulk create our event fires
-            EventFire.objects.bulk_create(events)
-
-    @classmethod
-    def update_field_events(cls, contact_field):
-        """
-        Updates any events for the passed in contact field
-        """
-        if not contact_field.is_active:
-            # remove any scheduled fires for the passed in field
-            EventFire.objects.filter(event__relative_to=contact_field, fired=None).delete()
-        else:
-            # cancel existing events, we are going to recreate them all
-            EventFire.objects.filter(event__relative_to=contact_field, fired=None).delete()
-
-            now = timezone.now()
-
-            org = contact_field.org
-            events = CampaignEvent.objects.filter(
-                relative_to=contact_field, campaign__is_active=True, campaign__is_archived=False, is_active=True
-            ).prefetch_related("relative_to")
-            for event in events:
-                field = event.relative_to
-                field_uuid = str(field.uuid)
-
-                contacts = (
-                    event.campaign.group.contacts.filter(is_active=True, is_blocked=False)
-                    .exclude(is_test=True)
-                    .extra(
-                        where=['%s::text[] <@ (extract_jsonb_keys("contacts_contact"."fields"))'],
-                        params=[[field_uuid]],
-                    )
-                )
-
-                events = []
-                for contact in contacts:
-                    contact.org = org
-                    scheduled = event.calculate_scheduled_fire_for_value(contact.get_field_value(field), now)
-
-                    # and if we have a date, then schedule it
-                    if scheduled:
-                        events.append(EventFire(event=event, contact=contact, scheduled=scheduled))
-
-                # bulk create our event fires
-                EventFire.objects.bulk_create(events)
-
-    @classmethod
-    def update_events_for_contact_groups(cls, contact, groups):
-        """
-        Updates all the events for a contact, across all campaigns.
-        Should be called anytime a contact field or contact group membership changes.
-        """
-
-        # for each campaign that might affect us
-        for campaign in Campaign.objects.filter(
-            group__in=groups, org=contact.org, is_active=True, is_archived=False
-        ).distinct():
-            # update all the events for the campaign
-            EventFire.update_campaign_events_for_contact(campaign, contact)
-
-    @classmethod
-    def update_events_for_contact_fields(cls, contact, keys):
-        """
-        Updates all the events for a contact, across all campaigns.
-        Should be called anytime a contact field or contact group membership changes.
-        """
-        # make sure we consider immutable fields(created_on)
-        keys = list(keys)
-        keys.extend(list(ContactField.IMMUTABLE_FIELDS))
-
-        events = CampaignEvent.objects.filter(
-            campaign__group__in=contact.user_groups,
-            campaign__org=contact.org,
-            relative_to__key__in=keys,
-            campaign__is_archived=False,
-            is_active=True,
-        ).prefetch_related("relative_to")
-
-        for event in events:
-            # remove any unfired events, they will get recreated below
-            EventFire.objects.filter(event=event, contact=contact, fired=None).delete()
-
-            # calculate our scheduled date
-            scheduled = event.calculate_scheduled_fire(contact)
-
-            # and if we have a date, then schedule it
-            if scheduled and not contact.is_test:
-                EventFire.objects.create(event=event, contact=contact, scheduled=scheduled)
-
-    @classmethod
-    def update_campaign_events_for_contact(cls, campaign, contact):
-        """
-        Updates all the events for the passed in contact and campaign.
-        Should be called anytime a contact field or contact group membership changes.
-        """
-        # remove any unfired events, they will get recreated below
-        EventFire.objects.filter(event__campaign=campaign, contact=contact, fired=None).delete()
-
-        # if we aren't archived and still in our campaign's group
-        if not campaign.is_archived and contact.user_groups.filter(id__in=[campaign.group.id]).exists():
-            # then scheduled all our events
-            for event in campaign.get_events():
-                # calculate our scheduled date
-                scheduled = event.calculate_scheduled_fire(contact)
-
-                # and if we have a date, then schedule it
-                if scheduled and not contact.is_test:
-                    EventFire.objects.create(event=event, contact=contact, scheduled=scheduled)
-
-    def __str__(self):
-        return "%s - %s" % (self.event, self.contact)
+    def __str__(self):  # pragma: no cover
+        return f"EventFire[event={self.event.uuid}, contact={self.contact.uuid}, scheduled={self.scheduled}]"
 
     class Meta:
         ordering = ("scheduled",)

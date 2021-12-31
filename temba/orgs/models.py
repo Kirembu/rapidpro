@@ -1,130 +1,55 @@
-import calendar
+import functools
 import itertools
 import logging
-import mimetypes
+import operator
 import os
-import random
-import re
-import traceback
-from collections import OrderedDict, defaultdict
-from datetime import datetime, timedelta
+from abc import ABCMeta
+from collections import defaultdict
+from datetime import timedelta
 from decimal import Decimal
 from enum import Enum
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
-from uuid import uuid4
+from urllib.parse import quote, urlencode, urlparse
 
 import pycountry
-import regex
+import pyotp
+import pytz
 import stripe
-from dateutil.relativedelta import relativedelta
+import stripe.error
 from django_redis import get_redis_connection
+from packaging.version import Version
 from requests import Session
 from smartmin.models import SmartModel
 from timezone_field import TimeZoneField
+from twilio.rest import Client as TwilioClient
 
 from django.conf import settings
-from django.contrib.auth.models import Group, User
+from django.contrib.auth.models import Group, Permission, User
+from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.core.files.temp import NamedTemporaryFile
 from django.db import models, transaction
-from django.db.models import F, Prefetch, Q, Sum
-from django.urls import reverse
+from django.db.models import Count, F, Prefetch, Q, Sum
 from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.text import slugify
 from django.utils.translation import ugettext_lazy as _
 
+from temba import mailroom
 from temba.archives.models import Archive
 from temba.bundles import get_brand_bundles, get_bundle_map
-from temba.locations.models import AdminBoundary, BoundaryAlias
-from temba.utils import analytics, chunk_list, languages
-from temba.utils.cache import get_cacheable_attr, get_cacheable_result, incrby_existing
-from temba.utils.currencies import currency_for_country
-from temba.utils.dates import datetime_to_str, get_datetime_format, str_to_datetime
-from temba.utils.email import send_custom_smtp_email, send_simple_email, send_template_email
-from temba.utils.models import JSONAsTextField, SquashableModel
+from temba.locations.models import AdminBoundary
+from temba.utils import chunk_list, json, languages
+from temba.utils.cache import get_cacheable_result
+from temba.utils.dates import datetime_to_str
+from temba.utils.email import send_template_email
+from temba.utils.models import JSONAsTextField, JSONField, SquashableModel
 from temba.utils.s3 import public_file_storage
-from temba.utils.text import random_string
-from temba.values.constants import Value
+from temba.utils.text import generate_token, random_string
+from temba.utils.timezones import timezone_to_country_code
+from temba.utils.uuid import uuid4
 
-EARLIEST_IMPORT_VERSION = "3"
-
-
-# making this a function allows it to be used as a default for Django fields
-def get_current_export_version():
-    from temba.flows.models import Flow
-
-    return Flow.VERSIONS[-1]
-
-
-MT_SMS_EVENTS = 1 << 0
-MO_SMS_EVENTS = 1 << 1
-MT_CALL_EVENTS = 1 << 2
-MO_CALL_EVENTS = 1 << 3
-ALARM_EVENTS = 1 << 4
-
-ALL_EVENTS = MT_SMS_EVENTS | MO_SMS_EVENTS | MT_CALL_EVENTS | MO_CALL_EVENTS | ALARM_EVENTS
-
-FREE_PLAN = "FREE"
-TRIAL_PLAN = "TRIAL"
-TIER1_PLAN = "TIER1"
-TIER2_PLAN = "TIER2"
-TIER3_PLAN = "TIER3"
-
-TIER_39_PLAN = "TIER_39"
-TIER_249_PLAN = "TIER_249"
-TIER_449_PLAN = "TIER_449"
-
-DAYFIRST = "D"
-MONTHFIRST = "M"
-
-PLANS = (
-    (FREE_PLAN, _("Free Plan")),
-    (TRIAL_PLAN, _("Trial")),
-    (TIER_39_PLAN, _("Bronze")),
-    (TIER1_PLAN, _("Silver")),
-    (TIER2_PLAN, _("Gold (Legacy)")),
-    (TIER3_PLAN, _("Platinum (Legacy)")),
-    (TIER_249_PLAN, _("Gold")),
-    (TIER_449_PLAN, _("Platinum")),
-)
-
-DATE_PARSING = ((DAYFIRST, "DD-MM-YYYY"), (MONTHFIRST, "MM-DD-YYYY"))
-
-APPLICATION_SID = "APPLICATION_SID"
-ACCOUNT_SID = "ACCOUNT_SID"
-ACCOUNT_TOKEN = "ACCOUNT_TOKEN"
-
-NEXMO_KEY = "NEXMO_KEY"
-NEXMO_SECRET = "NEXMO_SECRET"
-NEXMO_UUID = "NEXMO_UUID"
-NEXMO_APP_ID = "NEXMO_APP_ID"
-NEXMO_APP_PRIVATE_KEY = "NEXMO_APP_PRIVATE_KEY"
-
-TRANSFERTO_ACCOUNT_LOGIN = "TRANSFERTO_ACCOUNT_LOGIN"
-TRANSFERTO_AIRTIME_API_TOKEN = "TRANSFERTO_AIRTIME_API_TOKEN"
-TRANSFERTO_ACCOUNT_CURRENCY = "TRANSFERTO_ACCOUNT_CURRENCY"
-
-SMTP_SERVER = "smtp_server"
-
-CHATBASE_AGENT_NAME = "CHATBASE_AGENT_NAME"
-CHATBASE_API_KEY = "CHATBASE_API_KEY"
-CHATBASE_TYPE_AGENT = "agent"
-CHATBASE_TYPE_USER = "user"
-CHATBASE_FEEDBACK = "CHATBASE_FEEDBACK"
-CHATBASE_VERSION = "CHATBASE_VERSION"
-
-ORG_STATUS = "STATUS"
-SUSPENDED = "suspended"
-RESTORED = "restored"
-WHITELISTED = "whitelisted"
-
-ORG_LOW_CREDIT_THRESHOLD = 500
-
-ORG_CREDIT_OVER = "O"
-ORG_CREDIT_LOW = "L"
-ORG_CREDIT_EXPIRING = "E"
+logger = logging.getLogger(__name__)
 
 # cache keys and TTLs
 ORG_LOCK_KEY = "org:%d:lock:%s"
@@ -138,6 +63,137 @@ ORG_LOW_CREDIT_THRESHOLD_CACHE_KEY = "org:%d:cache:low_credits_threshold"
 
 ORG_LOCK_TTL = 60  # 1 minute
 ORG_CREDITS_CACHE_TTL = 7 * 24 * 60 * 60  # 1 week
+
+
+class DependencyMixin:
+    """
+    Utility mixin for models which can be flow dependencies
+    """
+
+    soft_dependent_types = {"flow"}
+
+    def get_dependents(self):
+        return {"flow": self.dependent_flows.filter(is_active=True)}
+
+    def release(self, user):
+        """
+        Mark this dependency's flows as having issues, and then remove the dependencies
+        """
+
+        for dep_type, deps in self.get_dependents().items():
+            if dep_type not in self.soft_dependent_types and deps.exists():
+                raise AssertionError(f"can't delete {self} that still has {dep_type} dependents")
+
+        self.dependent_flows.update(has_issues=True)
+        self.dependent_flows.clear()
+
+
+class IntegrationType(metaclass=ABCMeta):
+    """
+    IntegrationType is our abstract base type for third party integrations.
+    """
+
+    class Category(Enum):
+        CHANNELS = 1
+        EMAIL = 2
+        AIRTIME = 3
+        MONITORING = 4
+
+    # the verbose name for this type
+    name = None
+
+    # the short code for this type (< 16 chars, lowercase)
+    slug = None
+
+    # the icon to show for this type
+    icon = "icon-plug"
+
+    # the category of features this integration provides
+    category = None
+
+    def is_available_to(self, user) -> bool:
+        """
+        Determines whether this integration type is available to the given user
+        """
+        return True
+
+    def is_connected(self, org) -> bool:
+        """
+        Returns whether the given org is connected to this integration
+        """
+
+    def disconnect(self, org, user):
+        """
+        Disconnects this integration on the given org
+        """
+
+    def management_ui(self, org, formax):
+        """
+        Adds formax sections to provide a UI to manage this integration
+        """
+
+    def get_urls(self) -> list:
+        """
+        Returns the urls and views for this integration
+        """
+
+    @classmethod
+    def get_all(cls, category: Category = None) -> list:
+        """
+        Returns all possible types with the given category
+        """
+        from .integrations import TYPES
+
+        return [t for t in TYPES.values() if not category or t.category == category]
+
+
+class OrgRole(Enum):
+    ADMINISTRATOR = ("A", _("Administrator"), _("Administrators"), "Administrators", "administrators", "org_admins")
+    EDITOR = ("E", _("Editor"), _("Editors"), "Editors", "editors", "org_editors")
+    VIEWER = ("V", _("Viewer"), _("Viewers"), "Viewers", "viewers", "org_viewers")
+    AGENT = ("T", _("Agent"), _("Agents"), "Agents", "agents", "org_agents")
+    SURVEYOR = ("S", _("Surveyor"), _("Surveyors"), "Surveyors", "surveyors", "org_surveyors")
+
+    def __init__(self, code: str, display: str, display_plural: str, group_name: str, m2m_name: str, rel_name: str):
+        self.code = code
+        self.display = display
+        self.display_plural = display_plural
+        self.group_name = group_name
+        self.m2m_name = m2m_name
+        self.rel_name = rel_name
+
+    @classmethod
+    def from_code(cls, code: str):
+        for role in cls:
+            if role.code == code:
+                return role
+        return None
+
+    @classmethod
+    def from_group(cls, group: Group):
+        for role in cls:
+            if role.group == group:
+                return role
+        return None
+
+    @cached_property
+    def group(self):
+        """
+        Gets the auth group which defines the permissions for this role
+        """
+        return Group.objects.get(name=self.group_name)
+
+    def get_users(self, org):
+        """
+        The users with this role in the given org
+        """
+        return getattr(org, self.m2m_name).all()
+
+    def get_orgs(self, user):
+        """
+        The orgs which the given user belongs to with this role
+        """
+        return getattr(user, self.rel_name).all()
 
 
 class OrgLock(Enum):
@@ -163,12 +219,60 @@ class OrgCache(Enum):
 class Org(SmartModel):
     """
     An Org can have several users and is the main component that holds all Flows, Messages, Contacts, etc. Orgs
-    know their country so they can deal with locally formatted numbers (numbers provided without a country code). As such,
-    each org can only add phone channels from one country.
+    know their country so they can deal with locally formatted numbers (numbers provided without a country code).
+    As such, each org can only add phone channels from one country.
 
     Users will create new Org for Flows that should be kept separate (say for distinct projects), or for
     each country where they are deploying messaging applications.
     """
+
+    DATE_FORMAT_DAY_FIRST = "D"
+    DATE_FORMAT_MONTH_FIRST = "M"
+    DATE_FORMAT_YEAR_FIRST = "Y"
+    DATE_FORMAT_CHOICES = (
+        (DATE_FORMAT_DAY_FIRST, "DD-MM-YYYY"),
+        (DATE_FORMAT_MONTH_FIRST, "MM-DD-YYYY"),
+        (DATE_FORMAT_YEAR_FIRST, "YYYY-MM-DD"),
+    )
+
+    DATE_FORMATS_PYTHON = {
+        DATE_FORMAT_DAY_FIRST: "%d-%m-%Y",
+        DATE_FORMAT_MONTH_FIRST: "%m-%d-%Y",
+        DATE_FORMAT_YEAR_FIRST: "%Y-%m-%d",
+    }
+
+    DATE_FORMATS_ENGINE = {
+        DATE_FORMAT_DAY_FIRST: "DD-MM-YYYY",
+        DATE_FORMAT_MONTH_FIRST: "MM-DD-YYYY",
+        DATE_FORMAT_YEAR_FIRST: "YYYY-MM-DD",
+    }
+
+    CONFIG_VERIFIED = "verified"
+    CONFIG_SMTP_SERVER = "smtp_server"
+    CONFIG_TWILIO_SID = "ACCOUNT_SID"
+    CONFIG_TWILIO_TOKEN = "ACCOUNT_TOKEN"
+    CONFIG_VONAGE_KEY = "NEXMO_KEY"
+    CONFIG_VONAGE_SECRET = "NEXMO_SECRET"
+
+    EARLIEST_IMPORT_VERSION = "3"
+    CURRENT_EXPORT_VERSION = "13"
+
+    LIMIT_FIELDS = "fields"
+    LIMIT_GLOBALS = "globals"
+    LIMIT_GROUPS = "groups"
+    LIMIT_LABELS = "labels"
+    LIMIT_TOPICS = "topics"
+
+    DELETE_DELAY_DAYS = 7  # how many days after releasing that an org is deleted
+
+    BLOCKER_SUSPENDED = _(
+        "Sorry, your workspace is currently suspended. To re-enable starting flows and sending messages, please "
+        "contact support."
+    )
+    BLOCKER_FLAGGED = _(
+        "Sorry, your workspace is currently flagged. To re-enable starting flows and sending messages, please "
+        "contact support."
+    )
 
     uuid = models.UUIDField(unique=True, default=uuid4)
 
@@ -176,13 +280,11 @@ class Org(SmartModel):
     plan = models.CharField(
         verbose_name=_("Plan"),
         max_length=16,
-        choices=PLANS,
-        default=FREE_PLAN,
+        default=settings.DEFAULT_PLAN,
         help_text=_("What plan your organization is on"),
     )
-    plan_start = models.DateTimeField(
-        verbose_name=_("Plan Start"), auto_now_add=True, help_text=_("When the user switched to this plan")
-    )
+    plan_start = models.DateTimeField(null=True)
+    plan_end = models.DateTimeField(null=True)
 
     stripe_customer = models.CharField(
         verbose_name=_("Stripe Customer"),
@@ -192,35 +294,20 @@ class Org(SmartModel):
         help_text=_("Our Stripe customer id for your organization"),
     )
 
-    administrators = models.ManyToManyField(
-        User,
-        verbose_name=_("Administrators"),
-        related_name="org_admins",
-        help_text=_("The administrators in your organization"),
-    )
-
-    viewers = models.ManyToManyField(
-        User, verbose_name=_("Viewers"), related_name="org_viewers", help_text=_("The viewers in your organization")
-    )
-
-    editors = models.ManyToManyField(
-        User, verbose_name=_("Editors"), related_name="org_editors", help_text=_("The editors in your organization")
-    )
-
-    surveyors = models.ManyToManyField(
-        User,
-        verbose_name=_("Surveyors"),
-        related_name="org_surveyors",
-        help_text=_("The users can login via Android for your organization"),
-    )
+    # user role m2ms
+    administrators = models.ManyToManyField(User, related_name=OrgRole.ADMINISTRATOR.rel_name)
+    editors = models.ManyToManyField(User, related_name=OrgRole.EDITOR.rel_name)
+    viewers = models.ManyToManyField(User, related_name=OrgRole.VIEWER.rel_name)
+    agents = models.ManyToManyField(User, related_name=OrgRole.AGENT.rel_name)
+    surveyors = models.ManyToManyField(User, related_name=OrgRole.SURVEYOR.rel_name)
 
     language = models.CharField(
-        verbose_name=_("Language"),
+        verbose_name=_("Default Language"),
         max_length=64,
         null=True,
-        blank=True,
         choices=settings.LANGUAGES,
-        help_text=_("The main language used by this organization"),
+        default=settings.DEFAULT_LANGUAGE,
+        help_text=_("The default website language for new users."),
     )
 
     timezone = TimeZoneField(verbose_name=_("Timezone"))
@@ -228,17 +315,9 @@ class Org(SmartModel):
     date_format = models.CharField(
         verbose_name=_("Date Format"),
         max_length=1,
-        choices=DATE_PARSING,
-        default=DAYFIRST,
+        choices=DATE_FORMAT_CHOICES,
+        default=DATE_FORMAT_DAY_FIRST,
         help_text=_("Whether day comes first or month comes first in dates"),
-    )
-
-    webhook = JSONAsTextField(
-        null=True, verbose_name=_("Webhook"), default=dict, help_text=_("Webhook endpoint and configuration")
-    )
-
-    webhook_events = models.IntegerField(
-        default=0, verbose_name=_("Webhook Events"), help_text=_("Which type of actions will trigger webhook events.")
     )
 
     country = models.ForeignKey(
@@ -265,18 +344,27 @@ class Org(SmartModel):
         error_messages=dict(unique=_("This slug is not available")),
     )
 
+    limits = JSONField(default=dict)
+
     is_anon = models.BooleanField(
         default=False, help_text=_("Whether this organization anonymizes the phone numbers of contacts within it")
     )
 
-    primary_language = models.ForeignKey(
-        "orgs.Language",
-        null=True,
-        blank=True,
-        related_name="orgs",
-        help_text=_("The primary language will be used for contacts with no language preference."),
-        on_delete=models.PROTECT,
+    is_flagged = models.BooleanField(default=False, help_text=_("Whether this organization is currently flagged."))
+
+    is_suspended = models.BooleanField(default=False, help_text=_("Whether this organization is currently suspended."))
+
+    uses_topups = models.BooleanField(default=True, help_text=_("Whether this organization uses topups."))
+
+    is_multi_org = models.BooleanField(
+        default=False, help_text=_("Whether this organization can have child workspaces")
     )
+
+    is_multi_user = models.BooleanField(
+        default=False, help_text=_("Whether this organization can have multiple logins")
+    )
+
+    flow_languages = ArrayField(models.CharField(max_length=3), default=list)
 
     brand = models.CharField(
         max_length=128,
@@ -289,10 +377,6 @@ class Org(SmartModel):
         null=True, max_length=128, default=None, help_text=_("A password that allows users to register as surveyors")
     )
 
-    flow_server_enabled = models.BooleanField(
-        default=False, help_text=_("Whether flows and messages should be handled by the flow server")
-    )
-
     parent = models.ForeignKey(
         "orgs.Org",
         on_delete=models.PROTECT,
@@ -300,6 +384,10 @@ class Org(SmartModel):
         blank=True,
         help_text=_("The parent org that manages this org"),
     )
+
+    # when this org was released and when it was actually deleted
+    released_on = models.DateTimeField(null=True)
+    deleted_on = models.DateTimeField(null=True)
 
     @classmethod
     def get_unique_slug(cls, name):
@@ -317,9 +405,7 @@ class Org(SmartModel):
             return unique_slug
 
     def create_sub_org(self, name, timezone=None, created_by=None):
-
-        if self.is_multi_org_tier() and not self.parent:
-
+        if self.is_multi_org:
             if not timezone:
                 timezone = self.timezone
 
@@ -329,17 +415,29 @@ class Org(SmartModel):
             # generate a unique slug
             slug = Org.get_unique_slug(name)
 
+            brand = settings.BRANDING[self.brand]
+            plan = brand.get("default_plan", settings.DEFAULT_PLAN)
+
+            # if parent are on topups keep using those
+            if self.plan == settings.TOPUP_PLAN:
+                plan = settings.TOPUP_PLAN
+
             org = Org.objects.create(
                 name=name,
                 timezone=timezone,
+                language=self.language,
+                flow_languages=self.flow_languages,
                 brand=self.brand,
                 parent=self,
                 slug=slug,
                 created_by=created_by,
                 modified_by=created_by,
+                plan=plan,
+                is_multi_user=self.is_multi_user,
+                is_multi_org=self.is_multi_org,
             )
 
-            org.administrators.add(created_by)
+            org.add_user(created_by, OrgRole.ADMINISTRATOR)
 
             # initialize our org, but without any credits
             org.initialize(branding=org.get_branding(), topup_size=0)
@@ -371,8 +469,15 @@ class Org(SmartModel):
         """
         from temba.contacts.models import ContactGroup
 
-        counts = ContactGroup.get_system_group_counts(self, (ContactGroup.TYPE_ALL, ContactGroup.TYPE_BLOCKED))
-        return (counts[ContactGroup.TYPE_ALL] + counts[ContactGroup.TYPE_BLOCKED]) > 0
+        counts = ContactGroup.get_system_group_counts(self, (ContactGroup.TYPE_ACTIVE, ContactGroup.TYPE_BLOCKED))
+        return (counts[ContactGroup.TYPE_ACTIVE] + counts[ContactGroup.TYPE_BLOCKED]) > 0
+
+    def get_integrations(self, category: IntegrationType.Category) -> list:
+        """
+        Returns the connected integrations on this org of the given category
+        """
+
+        return [t for t in IntegrationType.get_all(category) if t.is_connected(self)]
 
     def clear_credit_cache(self):
         """
@@ -390,59 +495,99 @@ class Org(SmartModel):
             *active_topup_keys,
         )
 
-    def set_status(self, status):
-        config = self.config
-        config[ORG_STATUS] = status
-        self.config = config
-        self.save(update_fields=["config"])
+    def get_limit(self, limit_type):
+        return int(self.limits.get(limit_type, settings.ORG_LIMIT_DEFAULTS.get(limit_type)))
 
-    def set_suspended(self):
-        self.set_status(SUSPENDED)
+    def flag(self):
+        self.is_flagged = True
+        self.save(update_fields=("is_flagged", "modified_on"))
 
-    def set_whitelisted(self):
-        self.set_status(WHITELISTED)
+    def unflag(self):
+        self.is_flagged = False
+        self.save(update_fields=("is_flagged", "modified_on"))
 
-    def set_restored(self):
-        self.set_status(RESTORED)
+    def verify(self):
+        """
+        Unflags org and marks as verified so it won't be flagged automatically in future
+        """
+        self.is_flagged = False
+        self.config[Org.CONFIG_VERIFIED] = True
+        self.save(update_fields=("is_flagged", "config", "modified_on"))
 
-    def is_suspended(self):
-        return self.config.get(ORG_STATUS, None) == SUSPENDED
+    def is_verified(self):
+        """
+        A verified org is not subject to automatic flagging for suspicious activity
+        """
+        return self.config.get(Org.CONFIG_VERIFIED, False)
 
-    def is_whitelisted(self):
-        return self.config.get(ORG_STATUS, None) == WHITELISTED
+    def import_app(self, export_json, user, site=None):
+        """
+        Imports previously exported JSON
+        """
 
-    @transaction.atomic
-    def import_app(self, data, user, site=None):
-        from temba.flows.models import Flow
         from temba.campaigns.models import Campaign
+        from temba.contacts.models import ContactField, ContactGroup
+        from temba.flows.models import Flow
         from temba.triggers.models import Trigger
 
+        # only required field is version
+        if "version" not in export_json:
+            raise ValueError("Export missing version field")
+
+        export_version = Version(str(export_json["version"]))
+        export_site = export_json.get("site")
+
         # determine if this app is being imported from the same site
-        data_site = data.get("site", None)
         same_site = False
+        if export_site and site:
+            same_site = urlparse(export_site).netloc == urlparse(site).netloc
 
-        # compare the hosts of the sites to see if they are the same
-        if data_site and site:
-            same_site = urlparse(data_site).netloc == urlparse(site).netloc
+        # do we have a supported export version?
+        if not (Version(Org.EARLIEST_IMPORT_VERSION) <= export_version <= Version(Org.CURRENT_EXPORT_VERSION)):
+            raise ValueError(f"Unsupported export version {export_version}")
 
-        # see if our export needs to be updated
-        export_version = data.get("version", 0)
-        if Flow.is_before_version(export_version, EARLIEST_IMPORT_VERSION):  # pragma: needs cover
-            raise ValueError(_("Unknown version (%s)" % data.get("version", 0)))
+        # do we need to migrate the export forward?
+        if export_version < Version(Flow.CURRENT_SPEC_VERSION):
+            export_json = Flow.migrate_export(self, export_json, same_site, export_version)
 
-        if Flow.is_before_version(export_version, get_current_export_version()):
-            from temba.flows.models import FlowRevision
+        self.validate_import(export_json)
 
-            data = FlowRevision.migrate_export(self, data, same_site, export_version)
+        export_fields = export_json.get("fields", [])
+        export_groups = export_json.get("groups", [])
+        export_campaigns = export_json.get("campaigns", [])
+        export_triggers = export_json.get("triggers", [])
 
-        # we need to import flows first, they will resolve to
-        # the appropriate ids and update our definition accordingly
-        Flow.import_flows(data, self, user, same_site)
-        Campaign.import_campaigns(data, self, user, same_site)
-        Trigger.import_triggers(data, self, user, same_site)
+        dependency_mapping = {}  # dependency UUIDs in import => new UUIDs
+
+        with transaction.atomic():
+            ContactField.import_fields(self, user, export_fields)
+            ContactGroup.import_groups(self, user, export_groups, dependency_mapping)
+
+            new_flows = Flow.import_flows(self, user, export_json, dependency_mapping, same_site)
+
+            # these depend on flows so are imported last
+            new_campaigns = Campaign.import_campaigns(self, user, export_campaigns, same_site)
+            Trigger.import_triggers(self, user, export_triggers, same_site)
+
+        # queue mailroom tasks to schedule campaign events
+        for campaign in new_campaigns:
+            campaign.schedule_events_async()
+
+        # with all the flows and dependencies committed, we can now have mailroom do full validation
+        for flow in new_flows:
+            flow_info = mailroom.get_client().flow_inspect(self.id, flow.get_definition())
+            flow.has_issues = len(flow_info[Flow.INSPECT_ISSUES]) > 0
+            flow.save(update_fields=("has_issues",))
+
+    def validate_import(self, import_def):
+        from temba.triggers.models import Trigger
+
+        for trigger_def in import_def.get("triggers", []):
+            Trigger.validate_import_def(trigger_def)
 
     @classmethod
-    def export_definitions(cls, site_link, components):
+    def export_definitions(cls, site_link, components, include_fields=True, include_groups=True):
+        from temba.contacts.models import ContactField
         from temba.campaigns.models import Campaign
         from temba.flows.models import Flow
         from temba.triggers.models import Trigger
@@ -451,32 +596,54 @@ class Org(SmartModel):
         exported_campaigns = []
         exported_triggers = []
 
+        # users can't choose which fields/groups to export - we just include all the dependencies
+        fields = set()
+        groups = set()
+
         for component in components:
             if isinstance(component, Flow):
                 component.ensure_current_version()  # only export current versions
-                exported_flows.append(component.as_json(expand_contacts=True))
-            elif isinstance(component, Campaign):
-                exported_campaigns.append(component.as_json())
-            elif isinstance(component, Trigger):
-                exported_triggers.append(component.as_json())
+                exported_flows.append(component.get_definition())
 
-        return dict(
-            version=get_current_export_version(),
-            site=site_link,
-            flows=exported_flows,
-            campaigns=exported_campaigns,
-            triggers=exported_triggers,
-        )
+                if include_groups:
+                    groups.update(component.group_dependencies.all())
+                if include_fields:
+                    fields.update(component.field_dependencies.all())
+
+            elif isinstance(component, Campaign):
+                exported_campaigns.append(component.as_export_def())
+
+                if include_groups:
+                    groups.add(component.group)
+                if include_fields:
+                    for event in component.events.all():
+                        if event.relative_to.field_type == ContactField.FIELD_TYPE_USER:
+                            fields.add(event.relative_to)
+
+            elif isinstance(component, Trigger):
+                if component.type.exportable:
+                    exported_triggers.append(component.as_export_def())
+                    if include_groups:
+                        groups.update(component.groups.all())
+
+        return {
+            "version": Org.CURRENT_EXPORT_VERSION,
+            "site": site_link,
+            "flows": exported_flows,
+            "campaigns": exported_campaigns,
+            "triggers": exported_triggers,
+            "fields": [f.as_export_def() for f in sorted(fields, key=lambda f: f.key)],
+            "groups": [g.as_export_def() for g in sorted(groups, key=lambda g: g.name)],
+        }
 
     def can_add_sender(self):  # pragma: needs cover
         """
         If an org's telephone send channel is an Android device, let them add a bulk sender
         """
-        from temba.contacts.models import TEL_SCHEME
-        from temba.channels.models import Channel
+        from temba.contacts.models import URN
 
-        send_channel = self.get_send_channel(TEL_SCHEME)
-        return send_channel and send_channel.channel_type == Channel.TYPE_ANDROID
+        send_channel = self.get_send_channel(URN.TEL_SCHEME)
+        return send_channel and send_channel.is_android()
 
     def can_add_caller(self):  # pragma: needs cover
         return not self.supports_ivr() and self.is_connected_to_twilio()
@@ -484,174 +651,45 @@ class Org(SmartModel):
     def supports_ivr(self):
         return self.get_call_channel() or self.get_answer_channel()
 
-    def get_channel(self, scheme, country_code, role):
+    def get_channel(self, role: str, scheme: str):
         """
-        Gets a channel for this org which supports the given scheme and role
+        Gets a channel for this org which supports the given role and scheme
         """
         from temba.channels.models import Channel
 
-        channels = self.channels.filter(is_active=True, role__contains=role).order_by("-pk")
+        channels = self.channels.filter(is_active=True, role__contains=role).order_by("-id")
 
         if scheme is not None:
             channels = channels.filter(schemes__contains=[scheme])
 
-        channel = None
-        if country_code:
-            channel = channels.filter(country=country_code).first()
-
-        # no channel? try without country
-        if not channel:
-            channel = channels.first()
+        channel = channels.first()
 
         if channel and (role == Channel.ROLE_SEND or role == Channel.ROLE_CALL):
             return channel.get_delegate(role)
         else:
             return channel
 
-    @cached_property
-    def cached_all_contacts_group(self):
-        from temba.contacts.models import ContactGroup
-
-        return ContactGroup.all_groups.get(org=self, group_type=ContactGroup.TYPE_ALL)
-
-    @cached_property
-    def cached_channels(self):
-        channels = [c for c in self.channels.filter(is_active=True)]
-        for ch in channels:
-            ch.org = self
-
-        return channels
-
-    def clear_cached_channels(self):
-        if "cached_channels" in self.__dict__:
-            del self.__dict__["cached_channels"]
-        self.clear_cached_schemes()
-
-    def get_channel_for_role(self, role, scheme=None, contact_urn=None, country_code=None):
-        from temba.contacts.models import TEL_SCHEME
-        from temba.channels.models import Channel
-        from temba.contacts.models import ContactURN
-
-        if contact_urn:
-            scheme = contact_urn.scheme
-
-            # if URN has a previously used channel that is still active, use that
-            if contact_urn.channel and contact_urn.channel.is_active:
-                previous_sender = self.get_channel_delegate(contact_urn.channel, role)
-                if previous_sender:
-                    return previous_sender
-
-            if scheme == TEL_SCHEME:
-                path = contact_urn.path
-
-                # we don't have a channel for this contact yet, let's try to pick one from the same carrier
-                # we need at least one digit to overlap to infer a channel
-                contact_number = path.strip("+")
-                prefix = 1
-                channel = None
-
-                # try to use only a channel in the same country
-                if not country_code:
-                    country_code = ContactURN.derive_country_from_tel(path)
-
-                channels = []
-                if country_code:
-                    for c in self.cached_channels:
-                        if c.country == country_code and TEL_SCHEME in c.schemes:
-                            channels.append(c)
-
-                # no country specific channel, try to find any channel at all
-                if not channels:
-                    channels = [c for c in self.cached_channels if TEL_SCHEME in c.schemes]
-
-                # filter based on role and activity (we do this in python as channels can be prefetched so it is quicker in those cases)
-                senders = []
-                for c in channels:
-                    if c.is_active and c.address and role in c.role and not c.parent_id:
-                        senders.append(c)
-                senders.sort(key=lambda chan: chan.id)
-
-                # if we have more than one match, find the one with the highest overlap
-                if len(senders) > 1:
-                    for sender in senders:
-                        config = sender.config
-                        channel_prefixes = config.get(Channel.CONFIG_SHORTCODE_MATCHING_PREFIXES, [])
-                        if not channel_prefixes or not isinstance(channel_prefixes, list):
-                            channel_prefixes = [sender.address.strip("+")]
-
-                        for chan_prefix in channel_prefixes:
-                            for idx in range(prefix, len(chan_prefix) + 1):
-                                if idx >= prefix and chan_prefix[0:idx] == contact_number[0:idx]:
-                                    prefix = idx
-                                    channel = sender
-                                else:
-                                    break
-                elif senders:
-                    channel = senders[0]
-
-                if channel:
-                    if role == Channel.ROLE_SEND:
-                        return self.get_channel_delegate(channel, Channel.ROLE_SEND)
-                    else:
-                        return channel
-
-        # get any send channel without any country or URN hints
-        return self.get_channel(scheme, country_code, role)
-
-    def get_send_channel(self, scheme=None, contact_urn=None, country_code=None):
+    def get_send_channel(self, scheme=None):
         from temba.channels.models import Channel
 
-        return self.get_channel_for_role(
-            Channel.ROLE_SEND, scheme=scheme, contact_urn=contact_urn, country_code=country_code
-        )
+        return self.get_channel(Channel.ROLE_SEND, scheme=scheme)
 
-    def get_ussd_channel(self, contact_urn=None, country_code=None):
-        from temba.contacts.models import TEL_SCHEME
+    def get_receive_channel(self, scheme=None):
         from temba.channels.models import Channel
 
-        return self.get_channel_for_role(
-            Channel.ROLE_USSD, scheme=TEL_SCHEME, contact_urn=contact_urn, country_code=country_code
-        )
+        return self.get_channel(Channel.ROLE_RECEIVE, scheme=scheme)
 
-    def get_receive_channel(self, scheme, contact_urn=None, country_code=None):
+    def get_call_channel(self):
+        from temba.contacts.models import URN
         from temba.channels.models import Channel
 
-        return self.get_channel_for_role(
-            Channel.ROLE_RECEIVE, scheme=scheme, contact_urn=contact_urn, country_code=country_code
-        )
+        return self.get_channel(Channel.ROLE_CALL, scheme=URN.TEL_SCHEME)
 
-    def get_call_channel(self, contact_urn=None, country_code=None):
-        from temba.contacts.models import TEL_SCHEME
+    def get_answer_channel(self):
+        from temba.contacts.models import URN
         from temba.channels.models import Channel
 
-        return self.get_channel_for_role(
-            Channel.ROLE_CALL, scheme=TEL_SCHEME, contact_urn=contact_urn, country_code=country_code
-        )
-
-    def get_answer_channel(self, contact_urn=None, country_code=None):
-        from temba.contacts.models import TEL_SCHEME
-        from temba.channels.models import Channel
-
-        return self.get_channel_for_role(
-            Channel.ROLE_ANSWER, scheme=TEL_SCHEME, contact_urn=contact_urn, country_code=country_code
-        )
-
-    def get_ussd_channels(self):
-        from temba.channels.models import ChannelType, Channel
-
-        return Channel.get_by_category(self, ChannelType.Category.USSD)
-
-    def get_channel_delegate(self, channel, role):
-        """
-        Gets a channel's delegate for the given role with caching on the org object
-        """
-        cache_attr = "__%d__delegate_%s" % (channel.id, role)
-        if hasattr(self, cache_attr):
-            return getattr(self, cache_attr)
-
-        delegate = channel.get_delegate(role)
-        setattr(self, cache_attr, delegate)
-        return delegate
+        return self.get_channel(Channel.ROLE_ANSWER, scheme=URN.TEL_SCHEME)
 
     def get_schemes(self, role):
         """
@@ -669,32 +707,23 @@ class Org(SmartModel):
         setattr(self, cache_attr, schemes)
         return schemes
 
-    def clear_cached_schemes(self):
-        from temba.channels.models import Channel
-
-        for role in [
-            Channel.ROLE_SEND,
-            Channel.ROLE_RECEIVE,
-            Channel.ROLE_ANSWER,
-            Channel.ROLE_CALL,
-            Channel.ROLE_USSD,
-        ]:
-            cache_attr = "__schemes__%s" % role
-            if hasattr(self, cache_attr):
-                delattr(self, cache_attr)
-
     def normalize_contact_tels(self):
         """
         Attempts to normalize any contacts which don't have full e164 phone numbers
         """
-        from temba.contacts.models import ContactURN, TEL_SCHEME
+        from .tasks import normalize_contact_tels_task
 
-        # do we have an org-level country code? if so, try to normalize any numbers not starting with +
-        country_code = self.get_country_code()
-        if country_code:
-            urns = ContactURN.objects.filter(org=self, scheme=TEL_SCHEME).exclude(path__startswith="+")
-            for urn in urns:
-                urn.ensure_number_normalization(country_code)
+        normalize_contact_tels_task.delay(self.pk)
+
+    @cached_property
+    def active_contacts_group(self):
+        from temba.contacts.models import ContactGroup
+
+        return self.all_groups(manager="system_groups").get(group_type=ContactGroup.TYPE_ACTIVE)
+
+    @cached_property
+    def default_ticket_topic(self):
+        return self.topics.get(is_default=True)
 
     def get_resthooks(self):
         """
@@ -702,715 +731,305 @@ class Org(SmartModel):
         """
         return self.resthooks.filter(is_active=True).order_by("slug")
 
-    def get_webhook_url(self):
-        """
-        Returns a string with webhook url.
-        """
-        return self.webhook.get("url") if self.webhook else None
-
-    def get_webhook_headers(self):
-        """
-        Returns a dictionary of any webhook headers, e.g.:
-        {'Authorization': 'Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==',
-         'X-My-Special-Header': 'woo'}
-        """
-        return self.webhook.get("headers", {})
-
-    def get_channel_countries(self):
-        channel_countries = []
-
-        if not self.is_connected_to_transferto():
-            return channel_countries
-
-        channel_country_codes = self.channels.filter(is_active=True).exclude(country=None)
-        channel_country_codes = set(channel_country_codes.values_list("country", flat=True))
-
-        for country_code in channel_country_codes:
-            country_obj = pycountry.countries.get(alpha_2=country_code)
-            country_name = country_obj.name
-            currency = currency_for_country(country_code)
-            channel_countries.append(
-                dict(code=country_code, name=country_name, currency_code=currency.alpha_3, currency_name=currency.name)
-            )
-
-        return sorted(channel_countries, key=lambda k: k["name"])
-
     @classmethod
     def get_possible_countries(cls):
         return AdminBoundary.objects.filter(level=0).order_by("name")
 
-    def trigger_send(self, msgs=None):
+    def trigger_send(self):
         """
         Triggers either our Android channels to sync, or for all our pending messages to be queued
         to send.
         """
-        from temba.msgs.models import Msg
+
         from temba.channels.models import Channel
+        from temba.channels.types.android import AndroidType
+        from temba.msgs.models import Msg
 
-        # if we have msgs, then send just those
-        if msgs is not None:
-            ids = [m.id for m in msgs]
+        # sync all pending channels
+        for channel in self.channels.filter(is_active=True, channel_type=AndroidType.code):  # pragma: needs cover
+            channel.trigger_sync()
 
-            # trigger syncs for our android channels
-            for channel in self.channels.filter(is_active=True, channel_type=Channel.TYPE_ANDROID, msgs__id__in=ids):
-                channel.trigger_sync()
+        # otherwise, send any pending messages on our channels
+        r = get_redis_connection()
 
-            # and send those messages
-            Msg.send_messages(msgs)
+        key = "trigger_send_%d" % self.pk
 
-        # otherwise, sync all pending messages and channels
-        else:
-            for channel in self.channels.filter(
-                is_active=True, channel_type=Channel.TYPE_ANDROID
-            ):  # pragma: needs cover
-                channel.trigger_sync()
-
-            # otherwise, send any pending messages on our channels
-            r = get_redis_connection()
-
-            key = "trigger_send_%d" % self.pk
-
-            # only try to send all pending messages if nobody is doing so already
-            if not r.get(key):
-                with r.lock(key, timeout=900):
-                    pending = Channel.get_pending_messages(self)
-                    Msg.send_messages(pending)
+        # only try to send all pending messages if nobody is doing so already
+        if not r.get(key):
+            with r.lock(key, timeout=900):
+                pending = Channel.get_pending_messages(self)
+                Msg.send_messages(pending)
 
     def add_smtp_config(self, from_email, host, username, password, port, user):
+        username = quote(username)
+        password = quote(password, safe="")
         query = urlencode({"from": f"{from_email.strip()}", "tls": "true"})
 
-        config = self.config
-        config.update({SMTP_SERVER: f"smtp://{quote(username)}:{quote(password)}@{host}:{port}/?{query}"})
-        self.config = config
+        self.config.update({Org.CONFIG_SMTP_SERVER: f"smtp://{username}:{password}@{host}:{port}/?{query}"})
         self.modified_by = user
-        self.save()
+        self.save(update_fields=("config", "modified_by", "modified_on"))
 
     def remove_smtp_config(self, user):
         if self.config:
-            self.config.pop(SMTP_SERVER)
+            self.config.pop(Org.CONFIG_SMTP_SERVER, None)
             self.modified_by = user
-            self.save()
+            self.save(update_fields=("config", "modified_by", "modified_on"))
 
     def has_smtp_config(self):
         if self.config:
-            smtp_server = self.config.get(SMTP_SERVER, None)
-            return bool(smtp_server)
-        else:
-            return False
-
-    def email_action_send(self, recipients, subject, body):
-        if self.has_smtp_config():
-            smtp_server = self.config.get(SMTP_SERVER, None)
-            parsed_smtp_server = urlparse(smtp_server)
-            smtp_from_email = parse_qs(parsed_smtp_server.query).get("from", [None])[0] or ""
-            use_tls = parse_qs(parsed_smtp_server.query).get("tls", ["true"])[0].lower() == "true"
-
-            smtp_host = parsed_smtp_server.hostname
-            smtp_port = parsed_smtp_server.port
-            smtp_username = unquote(parsed_smtp_server.username)
-            smtp_password = unquote(parsed_smtp_server.password)
-
-            send_custom_smtp_email(
-                recipients, subject, body, smtp_from_email, smtp_host, smtp_port, smtp_username, smtp_password, use_tls
-            )
-        else:
-            from_email = self.get_branding().get("flow_email", settings.FLOW_FROM_EMAIL)
-            send_simple_email(recipients, subject, body, from_email=from_email)
+            return bool(self.config.get(Org.CONFIG_SMTP_SERVER))
+        return False
 
     def has_airtime_transfers(self):
         from temba.airtime.models import AirtimeTransfer
 
         return AirtimeTransfer.objects.filter(org=self).exists()
 
-    def connect_transferto(self, account_login, airtime_api_token, user):
-        transferto_config = {
-            TRANSFERTO_ACCOUNT_LOGIN: account_login.strip(),
-            TRANSFERTO_AIRTIME_API_TOKEN: airtime_api_token.strip(),
-        }
-
-        config = self.config
-        config.update(transferto_config)
-        self.config = config
+    def connect_vonage(self, api_key, api_secret, user):
+        self.config.update({Org.CONFIG_VONAGE_KEY: api_key.strip(), Org.CONFIG_VONAGE_SECRET: api_secret.strip()})
         self.modified_by = user
-        self.save()
-
-    def refresh_transferto_account_currency(self):
-        config = self.config
-        account_login = config.get(TRANSFERTO_ACCOUNT_LOGIN, None)
-        airtime_api_token = config.get(TRANSFERTO_AIRTIME_API_TOKEN, None)
-
-        from temba.airtime.models import AirtimeTransfer
-
-        response = AirtimeTransfer.post_transferto_api_response(
-            account_login, airtime_api_token, action="check_wallet"
-        )
-        parsed_response = AirtimeTransfer.parse_transferto_response(response.text)
-        account_currency = parsed_response.get("currency", "")
-        config.update({TRANSFERTO_ACCOUNT_CURRENCY: account_currency})
-        self.config = config
-        self.save()
-
-    def is_connected_to_transferto(self):
-        if self.config:
-            transferto_account_login = self.config.get(TRANSFERTO_ACCOUNT_LOGIN, None)
-            transferto_airtime_api_token = self.config.get(TRANSFERTO_AIRTIME_API_TOKEN, None)
-
-            return transferto_account_login and transferto_airtime_api_token
-        else:
-            return False
-
-    def remove_transferto_account(self, user):
-        if self.config:
-            self.config[TRANSFERTO_ACCOUNT_LOGIN] = ""
-            self.config[TRANSFERTO_AIRTIME_API_TOKEN] = ""
-            self.config[TRANSFERTO_ACCOUNT_CURRENCY] = ""
-            self.modified_by = user
-            self.save()
-
-    def connect_nexmo(self, api_key, api_secret, user):
-        from nexmo import Client as NexmoClient
-
-        nexmo_uuid = str(uuid4())
-        nexmo_config = {NEXMO_KEY: api_key.strip(), NEXMO_SECRET: api_secret.strip(), NEXMO_UUID: nexmo_uuid}
-        client = NexmoClient(key=nexmo_config[NEXMO_KEY], secret=nexmo_config[NEXMO_SECRET])
-        domain = self.get_brand_domain()
-
-        app_name = "%s/%s" % (domain, nexmo_uuid)
-
-        answer_url = "https://%s%s" % (domain, reverse("handlers.nexmo_call_handler", args=["answer", nexmo_uuid]))
-
-        event_url = "https://%s%s" % (domain, reverse("handlers.nexmo_call_handler", args=["event", nexmo_uuid]))
-
-        params = dict(
-            name=app_name,
-            type="voice",
-            answer_url=answer_url,
-            answer_method="POST",
-            event_url=event_url,
-            event_method="POST",
-        )
-
-        response = client.create_application(params=params)
-        app_id = response.get("id", None)
-        private_key = response.get("keys", dict()).get("private_key", None)
-
-        nexmo_config[NEXMO_APP_ID] = app_id
-        nexmo_config[NEXMO_APP_PRIVATE_KEY] = private_key
-
-        config = self.config
-        config.update(nexmo_config)
-        self.config = config
-        self.modified_by = user
-        self.save()
-
-        # clear all our channel configurations
-        self.clear_channel_caches()
-
-    def nexmo_uuid(self):
-        config = self.config
-        return config.get(NEXMO_UUID, None)
+        self.save(update_fields=("config", "modified_by", "modified_on"))
 
     def connect_twilio(self, account_sid, account_token, user):
-        twilio_config = {ACCOUNT_SID: account_sid, ACCOUNT_TOKEN: account_token}
-
-        config = self.config
-        config.update(twilio_config)
-        self.config = config
+        self.config.update({Org.CONFIG_TWILIO_SID: account_sid, Org.CONFIG_TWILIO_TOKEN: account_token})
         self.modified_by = user
-        self.save()
+        self.save(update_fields=("config", "modified_by", "modified_on"))
 
-        # clear all our channel configurations
-        self.clear_channel_caches()
-
-    def is_connected_to_nexmo(self):
+    def is_connected_to_vonage(self):
         if self.config:
-            nexmo_key = self.config.get(NEXMO_KEY, None)
-            nexmo_secret = self.config.get(NEXMO_SECRET, None)
-            nexmo_uuid = self.config.get(NEXMO_UUID, None)
-
-            return nexmo_key and nexmo_secret and nexmo_uuid
-        else:
-            return False
+            return self.config.get(Org.CONFIG_VONAGE_KEY) and self.config.get(Org.CONFIG_VONAGE_SECRET)
+        return False
 
     def is_connected_to_twilio(self):
         if self.config:
-            account_sid = self.config.get(ACCOUNT_SID, None)
-            account_token = self.config.get(ACCOUNT_TOKEN, None)
-            if account_sid and account_token:
-                return True
+            return self.config.get(Org.CONFIG_TWILIO_SID) and self.config.get(Org.CONFIG_TWILIO_TOKEN)
         return False
 
-    def remove_nexmo_account(self, user):
+    def remove_vonage_account(self, user):
         if self.config:
-            # release any nexmo channels
+            # release any vonage channels
             for channel in self.channels.filter(is_active=True, channel_type="NX"):  # pragma: needs cover
-                channel.release()
+                channel.release(user)
 
-            self.config[NEXMO_KEY] = ""
-            self.config[NEXMO_SECRET] = ""
+            self.config.pop(Org.CONFIG_VONAGE_KEY, None)
+            self.config.pop(Org.CONFIG_VONAGE_SECRET, None)
             self.modified_by = user
-            self.save()
-
-            # clear all our channel configurations
-            self.clear_channel_caches()
+            self.save(update_fields=("config", "modified_by", "modified_on"))
 
     def remove_twilio_account(self, user):
         if self.config:
-            # release any twilio and twilio messaging sevice channels
+            # release any Twilio and Twilio Messaging Service channels
             for channel in self.channels.filter(is_active=True, channel_type__in=["T", "TMS"]):
-                channel.release()
+                channel.release(user)
 
-            self.config[ACCOUNT_SID] = ""
-            self.config[ACCOUNT_TOKEN] = ""
-            self.config[APPLICATION_SID] = ""
+            self.config.pop(Org.CONFIG_TWILIO_SID, None)
+            self.config.pop(Org.CONFIG_TWILIO_TOKEN, None)
             self.modified_by = user
-            self.save()
-
-            # clear all our channel configurations
-            self.clear_channel_caches()
-
-    def connect_chatbase(self, agent_name, api_key, version, user):
-        chatbase_config = {CHATBASE_AGENT_NAME: agent_name, CHATBASE_API_KEY: api_key, CHATBASE_VERSION: version}
-
-        config = self.config
-        config.update(chatbase_config)
-        self.config = config
-        self.modified_by = user
-        self.save()
-
-    def remove_chatbase_account(self, user):
-        config = self.config
-
-        if CHATBASE_AGENT_NAME in config:
-            del config[CHATBASE_AGENT_NAME]
-
-        if CHATBASE_API_KEY in config:
-            del config[CHATBASE_API_KEY]
-
-        if CHATBASE_VERSION in config:
-            del config[CHATBASE_VERSION]
-
-        self.config = config
-        self.modified_by = user
-        self.save()
-
-    def get_chatbase_credentials(self):
-        if self.config:
-            chatbase_api_key = self.config.get(CHATBASE_API_KEY, None)
-            chatbase_version = self.config.get(CHATBASE_VERSION, None)
-            return chatbase_api_key, chatbase_version
-        else:
-            return None, None
-
-    def get_verboice_client(self):  # pragma: needs cover
-        from temba.ivr.clients import VerboiceClient
-
-        channel = self.get_call_channel()
-        if channel.channel_type == "VB":
-            return VerboiceClient(channel)
-        return None
+            self.save(update_fields=("config", "modified_by", "modified_on"))
 
     def get_twilio_client(self):
-        from temba.ivr.clients import TwilioClient
-
-        if self.config:
-            account_sid = self.config.get(ACCOUNT_SID, None)
-            auth_token = self.config.get(ACCOUNT_TOKEN, None)
-            if account_sid and auth_token:
-                return TwilioClient(account_sid, auth_token, org=self)
+        account_sid = self.config.get(Org.CONFIG_TWILIO_SID)
+        auth_token = self.config.get(Org.CONFIG_TWILIO_TOKEN)
+        if account_sid and auth_token:
+            return TwilioClient(account_sid, auth_token)
         return None
 
-    def get_nexmo_client(self):
-        from temba.ivr.clients import NexmoClient
+    def get_vonage_client(self):
+        from temba.channels.types.vonage.client import VonageClient
 
-        if self.config:
-            api_key = self.config.get(NEXMO_KEY, None)
-            api_secret = self.config.get(NEXMO_SECRET, None)
-            app_id = self.config.get(NEXMO_APP_ID, None)
-            app_private_key = self.config.get(NEXMO_APP_PRIVATE_KEY, None)
-            if api_key and api_secret:
-                return NexmoClient(api_key, api_secret, app_id, app_private_key, org=self)
-
+        api_key = self.config.get(Org.CONFIG_VONAGE_KEY)
+        api_secret = self.config.get(Org.CONFIG_VONAGE_SECRET)
+        if api_key and api_secret:
+            return VonageClient(api_key, api_secret)
         return None
 
-    def clear_channel_caches(self):
+    @property
+    def default_country_code(self) -> str:
         """
-        Clears any cached configurations we have for any of our channels.
+        Gets the default country as a 2-digit country code, e.g. RW, US
         """
-        from temba.channels.models import Channel
 
-        for channel in self.channels.exclude(channel_type="A"):
-            Channel.clear_cached_channel(channel.pk)
+        return self.default_country.alpha_2 if self.default_country else ""
 
-    def get_country_code(self):
+    @cached_property
+    def default_country(self):
         """
-        Gets the 2-digit country code, e.g. RW, US
+        Gets the default country as a pycountry country for this org
         """
-        return get_cacheable_attr(self, "_country_code", lambda: self.calculate_country_code())
 
-    def calculate_country_code(self):
-        # first try the actual country field
+        # first try the country boundary field
         if self.country:
-            try:
-                country = pycountry.countries.get(name=self.country.name)
-                if country:
-                    return country.alpha_2
-            except KeyError:  # pragma: no cover
-                # pycountry blows up if we pass it a country name it doesn't know
-                pass
+            country = pycountry.countries.get(name=self.country.name)
+            if country:
+                return country
 
-        # if that isn't set and we only have have one country set for our channels, use that
-        countries = self.channels.filter(is_active=True).exclude(country=None).order_by("country")
-        countries = countries.distinct("country").values_list("country", flat=True)
-        if len(countries) == 1:
-            return countries[0]
+        # next up try timezone
+        code = timezone_to_country_code(self.timezone)
+        if code:
+            country = pycountry.countries.get(alpha_2=code)
+            if country:
+                return country
+
+        # if that didn't work (not all timezones have a country) look for channels with countries
+        codes = (
+            self.channels.filter(is_active=True)
+            .exclude(country=None)
+            .order_by("country")
+            .distinct("country")
+            .values_list("country", flat=True)
+        )
+        if len(codes) == 1:
+            country = pycountry.countries.get(alpha_2=codes[0])
+            if country:
+                return country
 
         return None
 
-    def get_language_codes(self):
-        return get_cacheable_attr(self, "_language_codes", lambda: {l.iso_code for l in self.languages.all()})
-
-    def set_languages(self, user, iso_codes, primary):
+    def set_flow_languages(self, user, codes):
         """
-        Sets languages for this org, creating and deleting language objects as necessary
+        Sets languages used in flows for this org, creating and deleting language objects as necessary
         """
-        for iso_code in iso_codes:
-            name = languages.get_language_name(iso_code)
-            language = self.languages.filter(iso_code=iso_code).first()
 
-            # if it's valid and doesn't exist yet, create it
-            if name and not language:
-                language = self.languages.create(iso_code=iso_code, name=name, created_by=user, modified_by=user)
+        assert all([languages.get_name(c) for c in codes]), "not a valid or allowed language"
+        assert len(set(codes)) == len(codes), "language code list contains duplicates"
 
-            if iso_code == primary:
-                self.primary_language = language
-                self.save(update_fields=("primary_language",))
+        self.flow_languages = codes
+        self.modified_by = user
+        self.save(update_fields=("flow_languages", "modified_by", "modified_on"))
 
-        # unset the primary language if not in the new list of codes
-        if self.primary_language and self.primary_language.iso_code not in iso_codes:
-            self.primary_language = None
-            self.save(update_fields=("primary_language",))
+    def get_datetime_formats(self, *, seconds=False):
+        date_format = Org.DATE_FORMATS_PYTHON.get(self.date_format)
+        time_format = "%H:%M:%S" if seconds else "%H:%M"
+        datetime_format = f"{date_format} {time_format}"
+        return date_format, datetime_format
 
-        # remove any languages that are not in the new list
-        self.languages.exclude(iso_code__in=iso_codes).delete()
-
-        if hasattr(self, "_language_codes"):  # invalidate language cache if set
-            delattr(self, "_language_codes")
-
-    def get_dayfirst(self):
-        return self.date_format == DAYFIRST
-
-    def format_datetime(self, datetime, show_time=True):
+    def format_datetime(self, d, *, show_time=True, seconds=False):
         """
         Formats a datetime with or without time using this org's date format
         """
-        formats = get_datetime_format(self.get_dayfirst())
+        formats = self.get_datetime_formats(seconds=seconds)
         format = formats[1] if show_time else formats[0]
-        return datetime_to_str(datetime, format, self.timezone)
+        return datetime_to_str(d, format, self.timezone)
 
-    def parse_datetime(self, datetime_string):
-        if isinstance(datetime_string, datetime):
-            return datetime_string
-
-        return str_to_datetime(datetime_string, self.timezone, self.get_dayfirst())
-
-    def parse_number(self, decimal_string):
-        parsed = None
-
-        try:
-            parsed = Decimal(decimal_string)
-            if not parsed.is_finite() or parsed > Decimal("999999999999999999999999"):
-                parsed = None
-        except Exception:
-            pass
-
-        return parsed
-
-    def generate_location_query(self, name, level, is_alias=False):
-        if is_alias:
-            query = dict(name__iexact=name, boundary__level=level)
-            query["__".join(["boundary"] + ["parent"] * level)] = self.country
-        else:
-            query = dict(name__iexact=name, level=level)
-            query["__".join(["parent"] * level)] = self.country
-
-        return query
-
-    def find_boundary_by_name(self, name, level, parent):
+    def get_users_with_role(self, role: OrgRole):
         """
-        Finds the boundary with the passed in name or alias on this organization at the stated level.
-
-        @returns Iterable of matching boundaries
+        Gets the users who have the given role in this org
         """
-        # first check if we have a direct name match
-        if parent:
-            boundary = parent.children.filter(name__iexact=name, level=level)
-        else:
-            query = self.generate_location_query(name, level)
-            boundary = AdminBoundary.objects.filter(**query)
+        return role.get_users(self)
 
-        # not found by name, try looking up by alias
-        if not boundary:
-            if parent:
-                alias = BoundaryAlias.objects.filter(
-                    name__iexact=name, boundary__level=level, boundary__parent=parent
-                ).first()
-            else:
-                query = self.generate_location_query(name, level, True)
-                alias = BoundaryAlias.objects.filter(**query).first()
-
-            if alias:
-                boundary = [alias.boundary]
-
-        return boundary
-
-    def parse_location_path(self, location_string):
+    def get_admins(self):
         """
-        Parses a location path into a single location, returning None if not found
+        Convenience method for getting all org administrators
         """
-        # while technically we could resolve a full boundary path without a country, our policy is that
-        # if you don't have a country set then you don't have locations
-        return (
-            AdminBoundary.objects.filter(path__iexact=location_string.strip()).first()
-            if self.country_id and isinstance(location_string, str)
-            else None
-        )
+        return self.get_users_with_role(OrgRole.ADMINISTRATOR)
 
-    def parse_location(self, location_string, level, parent=None):
+    def get_users(self, *, roles=None):
         """
-        Attempts to parse the passed in location string at the passed in level. This does various tokenizing
-        of the string to try to find the best possible match.
-
-        @returns Iterable of matching boundaries
+        Gets all of the users across all roles for this org
         """
-        # no country? bail
-        if not self.country_id or not isinstance(location_string, str):
-            return []
+        user_sets = [role.get_users(self) for role in roles or OrgRole]
+        all_users = functools.reduce(operator.or_, user_sets)
+        return all_users.distinct()
 
-        boundary = None
+    def get_users_with_perm(self, perm: str):
+        """
+        Gets all of the users with the given permission for this org
+        """
 
-        # try it as a path first if it looks possible
-        if level == AdminBoundary.LEVEL_COUNTRY or AdminBoundary.PATH_SEPARATOR in location_string:
-            boundary = self.parse_location_path(location_string)
-            if boundary:
-                boundary = [boundary]
+        app_label, codename = perm.split(".")
+        permission = Permission.objects.get(content_type__app_label=app_label, codename=codename)
+        groups = Group.objects.filter(permissions=permission)
 
-        # try to look up it by full name
-        if not boundary:
-            boundary = self.find_boundary_by_name(location_string, level, parent)
+        return self.get_users(roles=[OrgRole.from_group(g) for g in groups])
 
-        # try removing punctuation and try that
-        if not boundary:
-            bare_name = regex.sub(r"\W+", " ", location_string, flags=regex.UNICODE | regex.V0).strip()
-            boundary = self.find_boundary_by_name(bare_name, level, parent)
+    def has_user(self, user: User) -> bool:
+        """
+        Returns whether the given user has a role in this org (only explicit roles, so doesn't include customer support)
+        """
+        return self.get_users().filter(id=user.id).exists()
 
-        # if we didn't find it, tokenize it
-        if not boundary:
-            words = regex.split(r"\W+", location_string.lower(), flags=regex.UNICODE | regex.V0)
-            if len(words) > 1:
-                for word in words:
-                    boundary = self.find_boundary_by_name(word, level, parent)
-                    if boundary:
-                        break
+    def add_user(self, user: User, role: OrgRole):
+        """
+        Adds the given user to this org with the given role
+        """
 
-                if not boundary:
-                    # still no boundary? try n-gram of 2
-                    for i in range(0, len(words) - 1):
-                        bigram = " ".join(words[i : i + 2])
-                        boundary = self.find_boundary_by_name(bigram, level, parent)
-                        if boundary:  # pragma: needs cover
-                            break
+        # remove user from any existing roles
+        if self.has_user(user):
+            self.remove_user(user)
 
-        return boundary
+        getattr(self, role.m2m_name).add(user)
 
-    def get_org_admins(self):
-        return self.administrators.all()
+    def remove_user(self, user: User):
+        """
+        Removes the given user from this org by removing them from any roles
+        """
+        for role in OrgRole:
+            getattr(self, role.m2m_name).remove(user)
 
-    def get_org_editors(self):
-        return self.editors.all()
+    def get_owner(self) -> User:
+        # look thru roles in order for the first added user
+        for role in OrgRole:
+            user = self.get_users_with_role(role).order_by("id").first()
+            if user:
+                return user
 
-    def get_org_viewers(self):
-        return self.viewers.all()
+        # default to user that created this org
+        return self.created_by
 
-    def get_org_surveyors(self):
-        return self.surveyors.all()
+    def get_user_role(self, user: User):
+        if user.is_staff:
+            return OrgRole.ADMINISTRATOR
 
-    def get_org_users(self):
-        org_users = self.get_org_admins() | self.get_org_editors() | self.get_org_viewers() | self.get_org_surveyors()
-        return org_users.distinct().order_by("email")
+        for role in OrgRole:
+            if self.get_users_with_role(role).filter(id=user.id).exists():
+                return role
 
-    def latest_admin(self):
-        admin = self.get_org_admins().last()
+        return None
 
-        # no admins? try editors
-        if not admin:  # pragma: needs cover
-            admin = self.get_org_editors().last()
+    def get_user_org_group(self, user: User):
+        role = self.get_user_role(user)
 
-        # no editors? try viewers
-        if not admin:  # pragma: needs cover
-            admin = self.get_org_viewers().last()
+        user._org_group = role.group if role else None
 
-        return admin
-
-    def is_free_plan(self):  # pragma: needs cover
-        return self.plan == FREE_PLAN or self.plan == TRIAL_PLAN
-
-    def is_import_flows_tier(self):
-        return self.get_purchased_credits() >= self.get_branding().get("tiers", {}).get("import_flows", 0)
-
-    def is_multi_user_tier(self):
-        return self.get_purchased_credits() >= self.get_branding().get("tiers", {}).get("multi_user", 0)
-
-    def is_multi_org_tier(self):
-        return not self.parent and self.get_purchased_credits() >= self.get_branding().get("tiers", {}).get(
-            "multi_org", 0
-        )
-
-    def get_user_org_group(self, user):
-        if user in self.get_org_admins():
-            user._org_group = Group.objects.get(name="Administrators")
-        elif user in self.get_org_editors():
-            user._org_group = Group.objects.get(name="Editors")
-        elif user in self.get_org_viewers():
-            user._org_group = Group.objects.get(name="Viewers")
-        elif user in self.get_org_surveyors():
-            user._org_group = Group.objects.get(name="Surveyors")
-        elif user.is_staff:
-            user._org_group = Group.objects.get(name="Administrators")
-        else:
-            user._org_group = None
-
-        return getattr(user, "_org_group", None)
+        return user._org_group
 
     def has_twilio_number(self):  # pragma: needs cover
         return self.channels.filter(channel_type="T")
 
-    def has_nexmo_number(self):  # pragma: needs cover
+    def has_vonage_number(self):  # pragma: needs cover
         return self.channels.filter(channel_type="NX")
 
-    def create_welcome_topup(self, topup_size=None):
+    def init_topups(self, topup_size=None):
         if topup_size:
             return TopUp.create(self.created_by, price=0, credits=topup_size, org=self)
+
+        # set whether we use topups based on our plan
+        self.uses_topups = self.plan == settings.TOPUP_PLAN
+        self.save(update_fields=["uses_topups"])
+
         return None
 
-    def create_system_groups(self):
-        """
-        Creates our system groups for this organization so that we can keep track of counts etc..
-        """
-        from temba.contacts.models import ContactGroup
-
-        self.all_groups.create(
-            name="All Contacts",
-            group_type=ContactGroup.TYPE_ALL,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-        self.all_groups.create(
-            name="Blocked Contacts",
-            group_type=ContactGroup.TYPE_BLOCKED,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-        self.all_groups.create(
-            name="Stopped Contacts",
-            group_type=ContactGroup.TYPE_STOPPED,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-
-    def create_system_contact_fields(self):
-        from temba.contacts.models import ContactField
-
-        ContactField.system_fields.create(
-            org_id=self.id,
-            label=_("ID"),
-            key="id",
-            value_type=Value.TYPE_NUMBER,
-            show_in_table=False,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-        ContactField.system_fields.create(
-            org_id=self.id,
-            label=_("Created On"),
-            key="created_on",
-            value_type=Value.TYPE_DATETIME,
-            show_in_table=False,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-        ContactField.system_fields.create(
-            org_id=self.id,
-            label=_("Contact Name"),
-            key="name",
-            value_type=Value.TYPE_TEXT,
-            show_in_table=False,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-        ContactField.system_fields.create(
-            org_id=self.id,
-            label=_("Language"),
-            key="language",
-            value_type=Value.TYPE_TEXT,
-            show_in_table=False,
-            created_by=self.created_by,
-            modified_by=self.modified_by,
-        )
-
     def create_sample_flows(self, api_url):
-        import json
-
         # get our sample dir
         filename = os.path.join(settings.STATICFILES_DIRS[0], "examples", "sample_flows.json")
 
         # for each of our samples
         with open(filename, "r") as example_file:
-            example = example_file.read()
+            samples = example_file.read()
 
-        user = self.get_user()
+        user = self.get_admins().first()
         if user:
             # some some substitutions
-            org_example = example.replace("{{EMAIL}}", user.username)
-            org_example = org_example.replace("{{API_URL}}", api_url)
+            samples = samples.replace("{{EMAIL}}", user.username).replace("{{API_URL}}", api_url)
 
             try:
-                self.import_app(json.loads(org_example), user)
-            except Exception:  # pragma: needs cover
-                import traceback
-
-                logger = logging.getLogger(__name__)
-                msg = "Failed creating sample flows"
-                logger.error(msg, exc_info=True, extra=dict(definition=json.loads(org_example)))
-                traceback.print_exc()
-
-    def is_notified_of_mt_sms(self):
-        return self.webhook_events & MT_SMS_EVENTS > 0
-
-    def is_notified_of_mo_sms(self):
-        return self.webhook_events & MO_SMS_EVENTS > 0
-
-    def is_notified_of_mt_call(self):
-        return self.webhook_events & MT_CALL_EVENTS > 0
-
-    def is_notified_of_mo_call(self):
-        return self.webhook_events & MO_CALL_EVENTS > 0
-
-    def is_notified_of_alarms(self):
-        return self.webhook_events & ALARM_EVENTS > 0
-
-    def get_user(self):
-        return self.administrators.filter(is_active=True).first()
-
-    def is_nearing_expiration(self):
-        """
-        Determines if the org is nearing expiration
-        """
-        newest_topup = TopUp.objects.filter(org=self, is_active=True).order_by("-created_on").first()
-        if newest_topup:
-            if timezone.now() + timedelta(days=30) > newest_topup.expires_on:
-                return newest_topup.get_remaining() > 0
-        return False
+                self.import_app(json.loads(samples), user)
+            except Exception as e:  # pragma: needs cover
+                logger.error(
+                    f"Failed creating sample flows: {str(e)}",
+                    exc_info=True,
+                    extra=dict(definition=json.loads(samples)),
+                )
 
     def has_low_credits(self):
         return self.get_credits_remaining() <= self.get_low_credits_threshold()
@@ -1485,8 +1104,7 @@ class Org(SmartModel):
 
         # if we don't have an active topup, add up pending messages too
         if not self.get_active_topup_id():
-            test_contacts = self.org_contacts.filter(is_test=True).values_list("id", flat=True)
-            used_credits_sum += self.msgs.filter(topup=None).exclude(contact_id__in=test_contacts).count()
+            used_credits_sum += self.msgs.filter(topup=None).count()
 
             # we don't cache in this case
             return used_credits_sum, 0
@@ -1498,6 +1116,35 @@ class Org(SmartModel):
         Gets the number of credits remaining for this org
         """
         return self.get_credits_total() - self.get_credits_used()
+
+    def select_most_recent_topup(self, amount):
+        """
+        Determines the active topup with latest expiry date and returns that
+        along with how many credits we will be able to decrement from it. Amount
+        decremented is not guaranteed to be the full amount requested.
+        """
+        # if we have an active topup cache, we need to decrement the amount remaining
+        non_expired_topups = self.topups.filter(is_active=True, expires_on__gte=timezone.now()).order_by(
+            "-expires_on", "id"
+        )
+        active_topups = (
+            non_expired_topups.annotate(used_credits=Sum("topupcredits__used"))
+            .filter(credits__gt=0)
+            .filter(Q(used_credits__lt=F("credits")) | Q(used_credits=None))
+        )
+        active_topup = active_topups.first()
+
+        if active_topup:
+            available_credits = active_topup.get_remaining()
+
+            if amount > available_credits:
+                # use only what is available
+                return active_topup.id, available_credits
+            else:
+                # use the full amount
+                return active_topup.id, amount
+        else:  # pragma: no cover
+            return None, 0
 
     def allocate_credits(self, user, org, amount):
         """
@@ -1514,7 +1161,7 @@ class Org(SmartModel):
                     while amount or debited == 0:
 
                         # remove the credits from ourselves
-                        (topup_id, debited) = self.decrement_credit(amount)
+                        (topup_id, debited) = self.select_most_recent_topup(amount)
 
                         if topup_id:
                             topup = TopUp.objects.get(id=topup_id)
@@ -1551,45 +1198,6 @@ class Org(SmartModel):
 
         # couldn't allocate credits
         return False
-
-    def decrement_credit(self, amount=1):
-        """
-        Decrements this orgs credit by amount.
-
-        Determines the active topup and returns that along with how many credits we were able
-        to decrement it by. Amount decremented is not guaranteed to be the full amount requested.
-        """
-        r = get_redis_connection()
-
-        # we always consider this a credit 'used' since un-applied msgs are pending
-        # credit expenses for the next purchased topup
-        incrby_existing(ORG_CREDITS_USED_CACHE_KEY % self.id, amount)
-
-        # if we have an active topup cache, we need to decrement the amount remaining
-        active_topup_id = self.get_active_topup_id()
-        if active_topup_id:
-
-            remaining = r.decr(ORG_ACTIVE_TOPUP_REMAINING % (self.id, active_topup_id), amount)
-
-            # near the edge, clear out our cache and calculate from the db
-            if not remaining or int(remaining) < 100:
-                active_topup_id = None
-                self.clear_credit_cache()
-
-        # calculate our active topup if we need to
-        if not active_topup_id:
-            active_topup = self.get_active_topup(force_dirty=True)
-            if active_topup:
-                active_topup_id = active_topup.id
-                remaining = active_topup.get_remaining()
-                if amount > remaining:
-                    amount = remaining
-                r.decr(ORG_ACTIVE_TOPUP_REMAINING % (self.id, active_topup.id), amount)
-
-        if active_topup_id:
-            return (active_topup_id, amount)
-
-        return None, 0
 
     def get_active_topup(self, force_dirty=False):
         topup_id = self.get_active_topup_id(force_dirty=force_dirty)
@@ -1651,8 +1259,7 @@ class Org(SmartModel):
 
         with self.lock_on(OrgLock.credits):
             # get all items that haven't been credited
-            test_contacts = self.org_contacts.filter(is_test=True).values_list("id", flat=True)
-            msg_uncredited = self.msgs.filter(topup=None).exclude(contact_id__in=test_contacts).order_by("created_on")
+            msg_uncredited = self.msgs.filter(topup=None).order_by("created_on")
             all_uncredited = list(msg_uncredited)
 
             # get all topups that haven't expired
@@ -1695,21 +1302,34 @@ class Org(SmartModel):
         # any time we've reapplied topups, lets invalidate our credit cache too
         self.clear_credit_cache()
 
-    def current_plan_start(self):
-        today = timezone.now().date()
+        # if we our suspended and have credits now, unsuspend ourselves
+        if self.is_suspended and self.get_credits_remaining() > 0:
+            self.is_suspended = False
+            self.save(update_fields=["is_suspended"])
 
-        # move it to the same day our plan started (taking into account short months)
-        plan_start = today.replace(day=min(self.plan_start.day, calendar.monthrange(today.year, today.month)[1]))
+        # update our capabilities based on topups
+        self.update_capabilities()
 
-        if plan_start > today:  # pragma: needs cover
-            plan_start -= relativedelta(months=1)
+    def reset_capabilities(self):
+        """
+        Resets our capabilities based on the current tiers, mostly used in unit tests
+        """
+        self.is_multi_user = False
+        self.is_multi_org = False
+        self.update_capabilities()
 
-        return plan_start
+    def update_capabilities(self):
+        """
+        Using our topups and brand settings, figures out whether this org should be multi-user and multi-org. We never
+        disable one of these capabilities, but will turn it on for those that qualify via credits
+        """
+        if self.get_purchased_credits() >= self.get_branding().get("tiers", {}).get("multi_org", 0):
+            self.is_multi_org = True
 
-    def current_plan_end(self):
-        plan_start = self.current_plan_start()
-        plan_end = plan_start + relativedelta(months=1)
-        return plan_end
+        if self.get_purchased_credits() >= self.get_branding().get("tiers", {}).get("multi_user", 0):
+            self.is_multi_user = True
+
+        self.save(update_fields=("is_multi_user", "is_multi_org"))
 
     def get_stripe_customer(self):  # pragma: no cover
         # We can't test stripe in unit tests since it requires javascript tokens to be generated
@@ -1720,43 +1340,12 @@ class Org(SmartModel):
             stripe.api_key = get_stripe_credentials()[1]
             customer = stripe.Customer.retrieve(self.stripe_customer)
             return customer
-        except Exception:
-            traceback.print_exc()
+        except Exception as e:
+            logger.error(f"Could not get Stripe customer: {str(e)}", exc_info=True)
             return None
 
     def get_bundles(self):
         return get_brand_bundles(self.get_branding())
-
-    @cached_property
-    def cached_contact_fields(self):
-        from temba.contacts.models import ContactField
-
-        # build an ordered dictionary of key->contact field
-        fields = OrderedDict()
-        for cf in ContactField.user_fields.filter(org=self, is_active=True).order_by("key"):
-            cf.org = self
-            fields[cf.key] = cf
-
-        return fields
-
-    def clear_cached_groups(self):
-        if "__cached_groups" in self.__dict__:
-            del self.__dict__["__cached_groups"]
-
-    def get_group(self, uuid):
-        cached_groups = self.__dict__.get("__cached_groups", {})
-        existing = cached_groups.get(uuid, None)
-
-        if existing:
-            return existing
-
-        from temba.contacts.models import ContactGroup
-
-        existing = ContactGroup.user_groups.filter(org=self, uuid=uuid).first()
-        if existing:
-            cached_groups[uuid] = existing
-            self.__dict__["__cached_groups"] = cached_groups
-        return existing
 
     def add_credits(self, bundle, token, user):
         # look up our bundle
@@ -1776,9 +1365,11 @@ class Org(SmartModel):
         # 2. we already have a stripe customer, but they have just added a new card, we need to use that one
         # 3. we don't have a customer, so we need to create a new customer and use that card
 
-        # for our purposes, #1 and #2 are treated the same, we just always update the default card
+        validation_error = None
 
+        # for our purposes, #1 and #2 are treated the same, we just always update the default card
         try:
+
             if not customer or customer.email != user.email:
                 # then go create a customer object for this user
                 customer = stripe.Customer.create(card=token, email=user.email, description="{ org: %d }" % self.pk)
@@ -1792,16 +1383,11 @@ class Org(SmartModel):
                 # remove existing cards
                 # TODO: this is all a bit wonky because we are using the Stripe JS widget..
                 # if we instead used on our mechanism to display / edit cards we could be a bit smarter
-                existing_cards = [c for c in customer.cards.all().data]
+                existing_cards = [c for c in customer.cards.list().data]
                 for card in existing_cards:
                     card.delete()
 
-                try:
-                    card = customer.cards.create(card=token)
-                except stripe.CardError:
-                    raise ValidationError(
-                        _("Sorry, your card was declined, please contact your provider or try another card.")
-                    )
+                card = customer.cards.create(card=token)
 
                 customer.default_card = card.id
                 customer.save()
@@ -1850,7 +1436,8 @@ class Org(SmartModel):
             context["branding"] = branding
             context["subject"] = subject
 
-            send_template_email(to_email, subject, template, context, branding)
+            if settings.SEND_RECEIPTS:
+                send_template_email(to_email, subject, template, context, branding)
 
             # apply our new topups
             from .tasks import apply_topups_task
@@ -1859,15 +1446,19 @@ class Org(SmartModel):
 
             return topup
 
-        except ValidationError as e:
-            raise e
+        except stripe.error.CardError as e:
+            logger.warning(f"Error adding credits to org: {str(e)}", exc_info=True)
+            validation_error = _("Sorry, your card was declined, please contact your provider or try another card.")
 
-        except Exception:
-            logger = logging.getLogger(__name__)
-            logger.error("Error adding credits to org", exc_info=True)
-            raise ValidationError(
-                _("Sorry, we were unable to process your payment, please try again later or contact us.")
+        except Exception as e:
+            logger.error(f"Error adding credits to org: {str(e)}", exc_info=True)
+
+            validation_error = _(
+                "Sorry, we were unable to process your payment, please try again later or contact us."
             )
+
+        if validation_error is not None:
+            raise ValidationError(validation_error)
 
     def account_value(self):
         """
@@ -1878,91 +1469,14 @@ class Org(SmartModel):
             paid = 0
         return paid / 100
 
-    def update_plan(self, new_plan, token, user):  # pragma: no cover
-        # We can't test stripe in unit tests since it requires javascript tokens to be generated
-        stripe.api_key = get_stripe_credentials()[1]
-
-        # no plan change?  do nothing
-        if new_plan == self.plan:
-            return None
-
-        # this is our stripe customer id
-        stripe_customer = None
-
-        # our actual customer object
-        customer = self.get_stripe_customer()
-        if customer:
-            stripe_customer = customer.id
-
-        # cancel our plan on our stripe customer
-        if new_plan == FREE_PLAN:
-            if customer:
-                analytics.track(user.username, "temba.plan_cancelled", dict(cancelledPlan=self.plan))
-
-                try:
-                    subscription = customer.cancel_subscription(at_period_end=True)
-                except Exception:
-                    traceback.print_exc()
-                    raise ValidationError(
-                        _("Sorry, we are unable to cancel your plan at this time.  Please contact us.")
-                    )
-            else:
-                raise ValidationError(_("Sorry, we are unable to cancel your plan at this time.  Please contact us."))
-
-        else:
-            # we have a customer, try to upgrade them
-            if customer:
-                try:
-                    subscription = customer.update_subscription(plan=new_plan)
-
-                    analytics.track(user.username, "temba.plan_upgraded", dict(previousPlan=self.plan, plan=new_plan))
-
-                except Exception:
-                    # can't load it, oh well, we'll try to create one dynamically below
-                    traceback.print_exc()
-                    customer = None
-
-            # if we don't have a customer, go create one
-            if not customer:
-                try:
-                    # then go create a customer object for this user
-                    customer = stripe.Customer.create(
-                        card=token, plan=new_plan, email=user, description="{ org: %d }" % self.pk
-                    )
-
-                    stripe_customer = customer.id
-                    subscription = customer["subscription"]
-
-                    analytics.track(user.username, "temba.plan_upgraded", dict(previousPlan=self.plan, plan=new_plan))
-
-                except Exception:
-                    traceback.print_exc()
-                    raise ValidationError(
-                        _("Sorry, we were unable to charge your card, please try again later or contact us.")
-                    )
-
-        # update our org
-        self.stripe_customer = stripe_customer
-
-        if subscription["status"] != "active":
-            self.plan = FREE_PLAN
-        else:
-            self.plan = new_plan
-
-        self.plan_start = datetime.fromtimestamp(subscription["start"])
-        self.save()
-
-        return subscription
-
     def generate_dependency_graph(self, include_campaigns=True, include_triggers=False, include_archived=False):
         """
         Generates a dict of all exportable flows and campaigns for this org with each object's immediate dependencies
         """
         from temba.campaigns.models import Campaign, CampaignEvent
-        from temba.contacts.models import ContactGroup
+        from temba.contacts.models import ContactGroup, ContactField
         from temba.flows.models import Flow
 
-        flow_prefetches = ("action_sets", "rule_sets")
         campaign_prefetches = (
             Prefetch(
                 "events",
@@ -1972,12 +1486,11 @@ class Org(SmartModel):
             "flow_events__flow",
         )
 
-        all_flows = self.flows.filter(is_active=True).exclude(is_system=True).prefetch_related(*flow_prefetches)
-        all_flow_map = {f.uuid: f for f in all_flows}
+        all_flows = self.flows.filter(is_active=True).exclude(is_system=True)
 
         if include_campaigns:
             all_campaigns = (
-                self.campaign_set.filter(is_active=True).select_related("group").prefetch_related(*campaign_prefetches)
+                self.campaigns.filter(is_active=True).select_related("group").prefetch_related(*campaign_prefetches)
             )
         else:
             all_campaigns = Campaign.objects.none()
@@ -1989,7 +1502,7 @@ class Org(SmartModel):
         # build dependency graph for all flows and campaigns
         dependencies = defaultdict(set)
         for flow in all_flows:
-            dependencies[flow] = flow.get_dependencies(all_flow_map)
+            dependencies[flow] = flow.get_export_dependencies()
         for campaign in all_campaigns:
             dependencies[campaign] = set([e.flow for e in campaign.flow_events])
 
@@ -1997,18 +1510,21 @@ class Org(SmartModel):
         # in flow-group-flow relationships - only relationships that go through a campaign
         campaigns_by_group = defaultdict(list)
         if include_campaigns:
-            for campaign in self.campaign_set.filter(is_active=True).select_related("group"):
+            for campaign in self.campaigns.filter(is_active=True).select_related("group"):
                 campaigns_by_group[campaign.group].append(campaign)
 
         for c, deps in dependencies.items():
             if isinstance(c, Flow):
                 for d in list(deps):
+                    # not interested in groups or fields for now
+                    if isinstance(d, ContactField):
+                        deps.remove(d)
                     if isinstance(d, ContactGroup):
                         deps.remove(d)
                         deps.update(campaigns_by_group[d])
 
         if include_triggers:
-            all_triggers = self.trigger_set.filter(is_archived=False, is_active=True).select_related("flow")
+            all_triggers = self.triggers.filter(is_archived=False, is_active=True).select_related("flow")
             for trigger in all_triggers:
                 dependencies[trigger] = {trigger.flow}
 
@@ -2049,19 +1565,29 @@ class Org(SmartModel):
 
         return all_components
 
-    def initialize(self, branding=None, topup_size=None):
+    def initialize(self, branding=None, topup_size=None, sample_flows=True):
         """
         Initializes an organization, creating all the dependent objects we need for it to work properly.
         """
         from temba.middleware import BrandingMiddleware
+        from temba.contacts.models import ContactField, ContactGroup
+        from temba.tickets.models import Ticketer, Topic
 
-        if not branding:
-            branding = BrandingMiddleware.get_branding_for_host("")
+        with transaction.atomic():
+            if not branding:
+                branding = BrandingMiddleware.get_branding_for_host("")
 
-        self.create_system_groups()
-        self.create_system_contact_fields()
-        self.create_sample_flows(branding.get("api_link", ""))
-        self.create_welcome_topup(topup_size)
+            ContactGroup.create_system_groups(self)
+            ContactField.create_system_fields(self)
+            Ticketer.create_internal_ticketer(self, branding)
+            Topic.create_default_topic(self)
+
+            self.init_topups(topup_size)
+            self.update_capabilities()
+
+        # outside of the transaction as it's going to call out to mailroom for flow validation
+        if sample_flows:
+            self.create_sample_flows(branding.get("api_link", ""))
 
     def download_and_save_media(self, request, extension=None):  # pragma: needs cover
         """
@@ -2102,32 +1628,6 @@ class Org(SmartModel):
         if archive:
             return archive.get_end_date()
 
-    def save_response_media(self, response):
-        disposition = response.headers.get("Content-Disposition", None)
-        content_type = response.headers.get("Content-Type", None)
-
-        downloaded = None
-
-        if content_type:
-            extension = None
-            if disposition == "inline":
-                extension = mimetypes.guess_extension(content_type)
-                extension = extension.strip(".")
-            elif disposition:
-                filename = re.findall('filename="(.+)"', disposition)[0]
-                extension = filename.rpartition(".")[2]
-            elif content_type == "audio/x-wav":
-                extension = "wav"
-
-            temp = NamedTemporaryFile(delete=True)
-            temp.write(response.content)
-            temp.flush()
-
-            # save our file off
-            downloaded = self.save_media(File(temp), extension)
-
-        return content_type, downloaded
-
     def save_media(self, file, extension):
         """
         Saves the given file data with the extension and returns an absolute url to the result
@@ -2144,106 +1644,175 @@ class Org(SmartModel):
 
         return f"{settings.STORAGE_URL}/{location}"
 
-    def release(self, *, release_users=True, immediately=False):
+    def release(self, user, *, release_users=True):
+        """
+        Releases this org, marking it as inactive. Actual deletion of org data won't happen until after 7 days unless
+        delete is True.
+        """
 
         # free our children
         Org.objects.filter(parent=self).update(parent=None)
 
         # deactivate ourselves
         self.is_active = False
-        self.save(update_fields=("is_active", "modified_on"))
+        self.modified_by = user
+        self.released_on = timezone.now()
+        self.save(update_fields=("is_active", "released_on", "modified_by", "modified_on"))
 
-        # immediately release our channels
-        from temba.channels.models import Channel
-
-        for channel in Channel.objects.filter(org=self, is_active=True):
-            channel.release()
+        # and immediately release our channels to halt messaging
+        for channel in self.channels.filter(is_active=True):
+            channel.release(user)
 
         # release any user that belongs only to us
         if release_users:
-            for user in self.get_org_users():
+            for org_user in self.get_users():
                 # check if this user is a member of any org on any brand
-                other_orgs = user.get_user_orgs().exclude(id=self.id)
+                other_orgs = org_user.get_user_orgs().exclude(id=self.id)
                 if not other_orgs:
-                    user.release(self.brand)
+                    org_user.release(user, brand=self.brand)
 
-        # clear out all of our users
-        self.administrators.clear()
-        self.editors.clear()
-        self.viewers.clear()
-        self.surveyors.clear()
+        # remove all the org users
+        for org_user in self.get_users():
+            self.remove_user(org_user)
 
-        if immediately:
-            self._full_release()
-
-    def _full_release(self):
+    def delete(self):
         """
-        Do the dirty work of deleting this org
+        Does an actual delete of this org
         """
+
+        assert not self.is_active and self.released_on, "can't delete an org which hasn't been released"
+        assert not self.deleted_on, "can't delete an org twice"
+
+        user = self.modified_by
+
+        # delete notifications and exports
+        self.notifications.all().delete()
+        self.exportcontactstasks.all().delete()
+        self.exportmessagestasks.all().delete()
+        self.exportflowresultstasks.all().delete()
+
+        for label in self.msgs_labels(manager="all_objects").all():
+            label.release(user)
+            label.delete()
+
         msg_ids = self.msgs.all().values_list("id", flat=True)
 
         # might be a lot of messages, batch this
         for id_batch in chunk_list(msg_ids, 1000):
-            for msg in self.msgs.filter(id__in=msg_ids):
+            for msg in self.msgs.filter(id__in=id_batch):
                 msg.release()
 
         # our system label counts
         self.system_labels.all().delete()
 
-        for channel in self.channels.all():
-            channel.release()
-            channel.delete()
-
-        # any airtime transfers associate with us go away
-        self.airtime_transfers.all().delete()
-
-        # delete our contacts
-        for contact in self.org_contacts.all():
-            contact.release(contact.modified_by)
-            contact.delete()
-
-        # delete our contacts
-        for contactfield in self.contactfields(manager="all_fields").all():
-            contactfield.release(contactfield.modified_by)
-            contactfield.delete()
-
-        # and all of the groups
-        for group in self.all_groups.all():
-            group.release()
-            group.delete()
+        # delete all our campaigns and associated events
+        for c in self.campaigns.all():
+            c.delete()
 
         # delete everything associated with our flows
         for flow in self.flows.all():
-
-            # we want to manually release runs so we dont fire a task to do it
-            flow.release()
-            flow.release_runs()
-
-            for rev in flow.revisions.all():
-                rev.release()
-
-            flow.rule_sets.all().delete()
-            flow.action_sets.all().delete()
-            flow.counts.all().delete()
-
+            # we want to manually release runs so we don't fire a mailroom task to do it
+            flow.release(user, interrupt_sessions=False)
             flow.delete()
+
+        # delete our flow labels (deleting a label deletes its children)
+        for flow_label in self.flow_labels.filter(parent=None):
+            flow_label.delete()
+
+        # delete contact-related data
+        self.http_logs.all().delete()
+        self.sessions.all().delete()
+        self.ticket_events.all().delete()
+        self.tickets.all().delete()
+        self.topics.all().delete()
+        self.airtime_transfers.all().delete()
+
+        # delete our contacts
+        for contact in self.contacts.all():
+            contact.release(user, full=True, immediately=True)
+            contact.delete()
+
+        # delete all our URNs
+        self.urns.all().delete()
+
+        # delete our fields
+        for contactfield in self.contactfields(manager="all_fields").all():
+            contactfield.release(user)
+            contactfield.delete()
+
+        # delete our groups
+        for group in self.all_groups.all():
+            group.release(user)
+            group.delete()
+
+        # delete our channels
+        for channel in self.channels.all():
+            channel.counts.all().delete()
+            channel.logs.all().delete()
+            channel.template_translations.all().delete()
+
+            channel.delete()
+
+        for g in self.globals.all():
+            g.release(user)
+
+        # delete our classifiers
+        for classifier in self.classifiers.all():
+            classifier.release(user)
+            classifier.delete()
+
+        # delete our ticketers
+        for ticketer in self.ticketers.all():
+            ticketer.release(user)
+            ticketer.delete()
 
         # release all archives objects and files for this org
         Archive.release_org_archives(self)
 
         # return any unused credits to our parent
         if self.parent:
-            self.allocate_credits(self.modified_by, self.parent, self.get_credits_remaining())
+            self.allocate_credits(user, self.parent, self.get_credits_remaining())
 
         for topup in self.topups.all():
             topup.release()
 
-        # now what we've all been waiting for
-        self.delete()
+        self.webhookevent_set.all().delete()
+
+        for resthook in self.resthooks.all():
+            resthook.release(user)
+            for sub in resthook.subscribers.all():
+                sub.delete()
+            resthook.delete()
+
+        # release our broadcasts
+        for bcast in self.broadcast_set.filter(parent=None):
+            bcast.release()
+
+        # delete other related objects
+        self.api_tokens.all().delete()
+        self.invitations.all().delete()
+        self.credit_alerts.all().delete()
+        self.schedules.all().delete()
+        self.boundaryalias_set.all().delete()
+        self.templates.all().delete()
+
+        # needs to come after deletion of msgs and broadcasts as those insert new counts
+        self.system_labels.all().delete()
+
+        # save when we were actually deleted
+        self.modified_on = timezone.now()
+        self.deleted_on = timezone.now()
+        self.config = {}
+        self.surveyor_password = None
+        self.save()
 
     @classmethod
-    def create_user(cls, email, password):
+    def create_user(cls, email: str, password: str, language: str = None) -> User:
         user = User.objects.create_user(username=email, email=email, password=password)
+        if language:
+            user_settings = user.get_settings()
+            user_settings.language = language
+            user_settings.save(update_fields=("language",))
         return user
 
     @classmethod
@@ -2258,6 +1827,21 @@ class Org(SmartModel):
 
         return getattr(user, "_org", None)
 
+    def as_environment_def(self):
+        """
+        Returns this org as an environment definition as used by the flow engine
+        """
+
+        return {
+            "date_format": Org.DATE_FORMATS_ENGINE.get(self.date_format),
+            "time_format": "tt:mm",
+            "timezone": str(self.timezone),
+            "default_language": self.flow_languages[0] if self.flow_languages else None,
+            "allowed_languages": self.flow_languages,
+            "default_country": self.default_country_code,
+            "redaction_policy": "urns" if self.is_anon else "none",
+        }
+
     def __str__(self):
         return self.name
 
@@ -2265,7 +1849,10 @@ class Org(SmartModel):
 # ===================== monkey patch User class with a few extra functions ========================
 
 
-def release(user, brand):
+def release(user, releasing_user, *, brand):
+    """
+    Releases this user, and any orgs of which they are the sole owner
+    """
 
     # if our user exists across brands don't muck with the user
     if user.get_user_orgs().order_by("brand").distinct("brand").count() < 2:
@@ -2279,37 +1866,34 @@ def release(user, brand):
         user.save()
 
     # release any orgs we own on this brand
-    for org in user.get_owned_orgs(brand):
-        org.release(release_users=False)
+    for org in user.get_owned_orgs([brand]):
+        org.release(releasing_user, release_users=False)
 
-    # remove us as a user on any org for our brand
-    for org in user.get_user_orgs(brand):
-        org.administrators.remove(user)
-        org.editors.remove(user)
-        org.viewers.remove(user)
-        org.surveyors.remove(user)
+    # remove user from all roles on any org for our brand
+    for org in user.get_user_orgs([brand]):
+        org.remove_user(user)
 
 
-def get_user_orgs(user, brand=None):
-
+def get_user_orgs(user, brands=None):
     if user.is_superuser:
         return Org.objects.all()
 
-    user_orgs = user.org_admins.all() | user.org_editors.all() | user.org_viewers.all() | user.org_surveyors.all()
+    org_sets = [role.get_orgs(user) for role in OrgRole]
+    user_orgs = functools.reduce(operator.or_, org_sets)
 
-    if brand:
-        user_orgs = user_orgs.filter(brand=brand)
+    if brands:
+        user_orgs = user_orgs.filter(brand__in=brands)
 
     return user_orgs.filter(is_active=True).distinct().order_by("name")
 
 
-def get_owned_orgs(user, brand=None):
+def get_owned_orgs(user, brands=None):
     """
-    Gets all the orgs where this is the only user for the currend brand
+    Gets all the orgs where this is the only user for the current brand
     """
     owned_orgs = []
-    for org in user.get_user_orgs(brand=brand):
-        if not org.get_org_users().exclude(id=user.id).exists():
+    for org in user.get_user_orgs(brands=brands):
+        if not org.get_users().exclude(id=user.id).exists():
             owned_orgs.append(org)
     return owned_orgs
 
@@ -2319,23 +1903,15 @@ def get_org(obj):
 
 
 def is_alpha_user(user):  # pragma: needs cover
-    return user.groups.filter(name="Alpha")
+    return user.groups.filter(name="Alpha").exists()
 
 
 def is_beta_user(user):  # pragma: needs cover
-    return user.groups.filter(name="Beta")
+    return user.groups.filter(name="Beta").exists()
 
 
-def get_settings(user):
-    if not user:  # pragma: needs cover
-        return None
-
-    settings = UserSettings.objects.filter(user=user).first()
-
-    if not settings:
-        settings = UserSettings.objects.create(user=user)
-
-    return settings
+def is_support_user(user):
+    return user.groups.filter(name="Customer Support").exists()
 
 
 def set_org(obj, org):
@@ -2374,18 +1950,93 @@ def _user_has_org_perm(user, org, permission):
     return org_group.permissions.filter(content_type__app_label=app_label, codename=codename).exists()
 
 
+def _user_get_settings(user):
+    """
+    Gets or creates user settings for this user
+    """
+    assert user and user.is_authenticated, "can't fetch user settings for anonymous users"
+
+    return UserSettings.get_or_create(user)
+
+
+def _user_record_auth(user):
+    user_settings = user.get_settings()
+    user_settings.last_auth_on = timezone.now()
+    user_settings.save(update_fields=("last_auth_on",))
+
+
+def _user_enable_2fa(user):
+    """
+    Enables 2FA for this user
+    """
+    user_settings = user.get_settings()
+    user_settings.two_factor_enabled = True
+    user_settings.save(update_fields=("two_factor_enabled",))
+
+    BackupToken.generate_for_user(user)
+
+
+def _user_disable_2fa(user):
+    """
+    Disables 2FA for this user
+    """
+    user_settings = user.get_settings()
+    user_settings.two_factor_enabled = False
+    user_settings.save(update_fields=("two_factor_enabled",))
+
+    user.backup_tokens.all().delete()
+
+
+def _user_verify_2fa(user, *, otp: str = None, backup_token: str = None) -> bool:
+    """
+    Verifies a user using a 2FA mechanism (OTP or backup token)
+    """
+    if otp:
+        secret = user.get_settings().otp_secret
+        return pyotp.TOTP(secret).verify(otp, valid_window=2)
+    elif backup_token:
+        token = user.backup_tokens.filter(token=backup_token, is_used=False).first()
+        if token:
+            token.is_used = True
+            token.save(update_fields=("is_used",))
+            return True
+
+    return False
+
+
+def _user_name(user: User) -> str:
+    return user.get_full_name()
+
+
+def _user_as_engine_ref(user: User) -> dict:
+    return {"email": user.email, "name": user.name}
+
+
+def _user_str(user):
+    as_str = _user_name(user)
+    if not as_str:
+        as_str = user.username
+    return as_str
+
+
 User.release = release
 User.get_org = get_org
 User.set_org = set_org
 User.is_alpha = is_alpha_user
 User.is_beta = is_beta_user
-User.get_settings = get_settings
+User.is_support = is_support_user
 User.get_user_orgs = get_user_orgs
 User.get_org_group = get_org_group
 User.get_owned_orgs = get_owned_orgs
 User.has_org_perm = _user_has_org_perm
-
-USER_GROUPS = (("A", _("Administrator")), ("E", _("Editor")), ("V", _("Viewer")), ("S", _("Surveyor")))
+User.get_settings = _user_get_settings
+User.record_auth = _user_record_auth
+User.enable_2fa = _user_enable_2fa
+User.disable_2fa = _user_disable_2fa
+User.verify_2fa = _user_verify_2fa
+User.name = property(_user_name)
+User.as_engine_ref = _user_as_engine_ref
+User.__str__ = _user_str
 
 
 def get_stripe_credentials():
@@ -2398,83 +2049,30 @@ def get_stripe_credentials():
     return (public_key, private_key)
 
 
-class Language(SmartModel):
-    """
-    A Language that has been added to the org. In the end and language is just an iso_code and name
-    and it is not really restricted to real-world languages at this level. Instead we restrict the
-    language selection options to real-world languages.
-    """
-
-    name = models.CharField(max_length=128)
-
-    iso_code = models.CharField(max_length=4)
-
-    org = models.ForeignKey(Org, on_delete=models.PROTECT, verbose_name=_("Org"), related_name="languages")
-
-    @classmethod
-    def create(cls, org, user, name, iso_code):
-        return cls.objects.create(org=org, name=name, iso_code=iso_code, created_by=user, modified_by=user)
-
-    def as_json(self):  # pragma: needs cover
-        return dict(name=self.name, iso_code=self.iso_code)
-
-    @classmethod
-    def get_localized_text(cls, text_translations, preferred_languages, default_text=""):
-        """
-        Returns the appropriate translation to use.
-        :param text_translations: A dictionary (or plain text) which contains our message indexed by language iso code
-        :param preferred_languages: The prioritized list of language preferences (list of iso codes)
-        :param default_text: default text to use if no match is found
-        """
-        # No translations, return our default text
-        if not text_translations:
-            return default_text
-
-        # If we are handed raw text without translations, just return that
-        if not isinstance(text_translations, dict):
-            return text_translations
-
-        # otherwise, find the first preferred language
-        for lang in preferred_languages:
-            localized = text_translations.get(lang)
-            if localized is not None:
-                return localized
-
-        return default_text
-
-    def __str__(self):  # pragma: needs cover
-        return "%s" % self.name
-
-
 class Invitation(SmartModel):
     """
     An Invitation to an e-mail address to join an Org with specific roles.
     """
 
-    org = models.ForeignKey(
-        Org,
-        on_delete=models.PROTECT,
-        verbose_name=_("Org"),
-        related_name="invitations",
-        help_text=_("The organization to which the account is invited to view"),
-    )
+    ROLE_CHOICES = [(r.code, r.display) for r in OrgRole]
 
-    email = models.EmailField(
-        verbose_name=_("Email"), help_text=_("The email to which we send the invitation of the viewer")
-    )
+    org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="invitations")
 
-    secret = models.CharField(
-        verbose_name=_("Secret"),
-        max_length=64,
-        unique=True,
-        help_text=_("a unique code associated with this invitation"),
-    )
+    email = models.EmailField()
 
-    user_group = models.CharField(max_length=1, choices=USER_GROUPS, default="V", verbose_name=_("User Role"))
+    secret = models.CharField(max_length=64, unique=True)
+
+    user_group = models.CharField(max_length=1, choices=ROLE_CHOICES, default=OrgRole.VIEWER.code)
 
     @classmethod
-    def create(cls, org, user, email, user_group):
-        return cls.objects.create(org=org, email=email, user_group=user_group, created_by=user, modified_by=user)
+    def create(cls, org, user, email, role: OrgRole):
+        return cls.objects.create(org=org, email=email, user_group=role.code, created_by=user, modified_by=user)
+
+    @classmethod
+    def bulk_create_or_update(cls, org, user, emails: list, role: OrgRole):
+        for email in emails:
+            invitation = cls.create(org, user, email, role)
+            invitation.send()
 
     def save(self, *args, **kwargs):
         if not self.secret:
@@ -2487,15 +2085,14 @@ class Invitation(SmartModel):
 
         return super().save(*args, **kwargs)
 
-    @classmethod
-    def generate_random_string(cls, length):  # pragma: needs cover
-        """
-        Generates a [length] characters alpha numeric secret
-        """
-        letters = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # avoid things that could be mistaken ex: 'I' and '1'
-        return "".join([random.choice(letters) for _ in range(length)])
+    @property
+    def role(self):
+        return OrgRole.from_code(self.user_group)
 
-    def send_invitation(self):
+    def send(self):
+        """
+        Sends this invitation as an email to the user
+        """
         from .tasks import send_invitation_email_task
 
         send_invitation_email_task(self.id)
@@ -2522,23 +2119,18 @@ class UserSettings(models.Model):
     """
 
     user = models.ForeignKey(User, on_delete=models.PROTECT, related_name="settings")
-    language = models.CharField(
-        max_length=8, choices=settings.LANGUAGES, default="en-us", help_text=_("Your preferred language")
-    )
-    tel = models.CharField(
-        verbose_name=_("Phone Number"),
-        max_length=16,
-        null=True,
-        blank=True,
-        help_text=_("Phone number for testing and recording voice flows"),
-    )
+    language = models.CharField(max_length=8, choices=settings.LANGUAGES, default=settings.DEFAULT_LANGUAGE)
+    otp_secret = models.CharField(max_length=16, default=pyotp.random_base32)
+    two_factor_enabled = models.BooleanField(default=False)
+    last_auth_on = models.DateTimeField(null=True)
 
-    def get_tel_formatted(self):
-        if self.tel:
-            import phonenumbers
+    @classmethod
+    def get_or_create(cls, user):
+        existing = UserSettings.objects.filter(user=user).first()
+        if existing:
+            return existing
 
-            normalized = phonenumbers.parse(self.tel, None)
-            return phonenumbers.format_number(normalized, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+        return cls.objects.create(user=user)
 
 
 class TopUp(SmartModel):
@@ -2698,8 +2290,8 @@ class TopUp(SmartModel):
         try:
             stripe.api_key = get_stripe_credentials()[1]
             return stripe.Charge.retrieve(self.stripe_charge)
-        except Exception:
-            traceback.print_exc()
+        except Exception as e:
+            logger.error(f"Could not get Stripe charge: {str(e)}", exc_info=True)
             return None
 
     def get_used(self):
@@ -2765,12 +2357,10 @@ class TopUpCredits(SquashableModel):
     Used to track number of credits used on a topup, mostly maintained by triggers on Msg insertion.
     """
 
-    SQUASH_OVER = ("topup_id",)
+    squash_over = ("topup_id",)
 
-    topup = models.ForeignKey(
-        TopUp, on_delete=models.PROTECT, help_text=_("The topup these credits are being used against")
-    )
-    used = models.IntegerField(help_text=_("How many credits were used, can be negative"))
+    topup = models.ForeignKey(TopUp, on_delete=models.PROTECT)
+    used = models.IntegerField()  # how many credits were used, can be negative
 
     def release(self):
         self.delete()
@@ -2798,24 +2388,24 @@ class CreditAlert(SmartModel):
     Tracks when we have sent alerts to organization admins about low credits.
     """
 
-    ALERT_TYPES_CHOICES = (
-        (ORG_CREDIT_OVER, _("Credits Over")),
-        (ORG_CREDIT_LOW, _("Low Credits")),
-        (ORG_CREDIT_EXPIRING, _("Credits expiring soon")),
-    )
+    TYPE_OVER = "O"
+    TYPE_LOW = "L"
+    TYPE_EXPIRING = "E"
+    TYPES = ((TYPE_OVER, _("Credits Over")), (TYPE_LOW, _("Low Credits")), (TYPE_EXPIRING, _("Credits expiring soon")))
 
-    org = models.ForeignKey(Org, on_delete=models.PROTECT, help_text="The organization this alert was triggered for")
-    alert_type = models.CharField(max_length=1, choices=ALERT_TYPES_CHOICES, help_text="The type of this alert")
+    org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="credit_alerts")
+
+    alert_type = models.CharField(max_length=1, choices=TYPES)
 
     @classmethod
     def trigger_credit_alert(cls, org, alert_type):
-        # is there already an active alert at this threshold? if so, exit
-        if CreditAlert.objects.filter(is_active=True, org=org, alert_type=alert_type):  # pragma: needs cover
-            return None
+        # don't create a new alert if there is already an alert of this type for the org
+        if org.credit_alerts.filter(is_active=True, alert_type=alert_type).exists():
+            return
 
-        print("triggering %s credits alert type for %s" % (alert_type, org.name))
+        logging.info(f"triggering {alert_type} credits alert type for {org.name}")
 
-        admin = org.get_org_admins().first()
+        admin = org.get_admins().first()
 
         if admin:
             # Otherwise, create our alert objects and trigger our event
@@ -2829,14 +2419,15 @@ class CreditAlert(SmartModel):
         send_alert_email_task(self.id)
 
     def send_email(self):
-        email = self.created_by.email
-        if not email:  # pragma: needs cover
+        admin_emails = [admin.email for admin in self.org.get_admins().order_by("email")]
+
+        if len(admin_emails) == 0:
             return
 
         branding = self.org.get_branding()
         subject = _("%(name)s Credits Alert") % branding
         template = "orgs/email/alert_email"
-        to_email = email
+        to_email = admin_emails
 
         context = dict(org=self.org, now=timezone.now(), branding=branding, alert=self, customer=self.created_by)
         context["subject"] = subject
@@ -2845,14 +2436,14 @@ class CreditAlert(SmartModel):
 
     @classmethod
     def reset_for_org(cls, org):
-        CreditAlert.objects.filter(org=org).update(is_active=False)
+        org.credit_alerts.filter(is_active=True).update(is_active=False)
 
     @classmethod
     def check_org_credits(cls):
         from temba.msgs.models import Msg
 
         # all active orgs in the last hour
-        active_orgs = Msg.objects.filter(created_on__gte=timezone.now() - timedelta(hours=1))
+        active_orgs = Msg.objects.filter(created_on__gte=timezone.now() - timedelta(hours=1), org__uses_topups=True)
         active_orgs = active_orgs.order_by("org").distinct("org")
 
         for msg in active_orgs:
@@ -2863,8 +2454,151 @@ class CreditAlert(SmartModel):
             org_low_credits = org.has_low_credits()
 
             if org_remaining_credits <= 0:
-                CreditAlert.trigger_credit_alert(org, ORG_CREDIT_OVER)
+                CreditAlert.trigger_credit_alert(org, CreditAlert.TYPE_OVER)
             elif org_low_credits:  # pragma: needs cover
-                CreditAlert.trigger_credit_alert(org, ORG_CREDIT_LOW)
-            elif org.is_nearing_expiration():  # pragma: needs cover
-                CreditAlert.trigger_credit_alert(org, ORG_CREDIT_EXPIRING)
+                CreditAlert.trigger_credit_alert(org, CreditAlert.TYPE_LOW)
+
+    @classmethod
+    def check_topup_expiration(cls):
+        """
+        Triggers an expiring credit alert for any org that has its last
+        active topup expiring in the next 30 days and still has available credits
+        """
+
+        # get the ids of the last to expire topup, with credits, for each org
+        final_topups = (
+            TopUp.objects.filter(is_active=True, org__is_active=True, org__uses_topups=True, credits__gt=0)
+            .order_by("org_id", "-expires_on")
+            .distinct("org_id")
+            .values_list("id", flat=True)
+        )
+
+        # figure out which of those have credits remaining, and will expire in next 30 days
+        expiring_final_topups = (
+            TopUp.objects.filter(id__in=final_topups)
+            .annotate(used_credits=Sum("topupcredits__used"))
+            .filter(expires_on__gt=timezone.now(), expires_on__lte=(timezone.now() + timedelta(days=30)))
+            .filter(Q(used_credits__lt=F("credits")) | Q(used_credits=None))
+            .select_related("org")
+        )
+
+        for topup in expiring_final_topups:
+            CreditAlert.trigger_credit_alert(topup.org, CreditAlert.TYPE_EXPIRING)
+
+
+class BackupToken(models.Model):
+    """
+    A 2FA backup token for a user
+    """
+
+    user = models.ForeignKey(User, related_name="backup_tokens", on_delete=models.PROTECT)
+    token = models.CharField(max_length=18, unique=True, default=generate_token)
+    is_used = models.BooleanField(default=False)
+    created_on = models.DateTimeField(default=timezone.now)
+
+    @classmethod
+    def generate_for_user(cls, user, count: int = 10):
+        # delete any existing tokens for this user
+        user.backup_tokens.all().delete()
+
+        return [cls.objects.create(user=user) for i in range(count)]
+
+    def __str__(self):
+        return self.token
+
+
+class OrgActivity(models.Model):
+    """
+    Tracks various metrics for an organization on a daily basis:
+       * total # of contacts
+       * total # of active contacts (that sent or received a message)
+       * total # of messages sent
+       * total # of message received
+       * total # of active contacts in plan period up to that date (if there is one)
+    """
+
+    # the org this contact activity is being tracked for
+    org = models.ForeignKey("orgs.Org", related_name="contact_activity", on_delete=models.CASCADE)
+
+    # the day this activity was tracked for
+    day = models.DateField()
+
+    # the total number of contacts on this day
+    contact_count = models.IntegerField(default=0)
+
+    # the number of active contacts on this day
+    active_contact_count = models.IntegerField(default=0)
+
+    # the number of messages sent on this day
+    outgoing_count = models.IntegerField(default=0)
+
+    # the number of messages received on this day
+    incoming_count = models.IntegerField(default=0)
+
+    # the number of active contacts in the plan period (if they are on a plan)
+    plan_active_contact_count = models.IntegerField(null=True)
+
+    @classmethod
+    def update_day(cls, now):
+        """
+        Updates our org activity for the passed in day.
+        """
+        from temba.msgs.models import Msg
+
+        # truncate to midnight the same day in UTC
+        end = pytz.utc.normalize(now.astimezone(pytz.utc)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = end - timedelta(days=1)
+
+        # first get all our contact counts
+        contact_counts = Org.objects.filter(
+            is_active=True, contacts__is_active=True, contacts__created_on__lt=end
+        ).annotate(contact_count=Count("contacts"))
+
+        # then get active contacts
+        active_counts = Org.objects.filter(
+            is_active=True, msgs__created_on__gte=start, msgs__created_on__lt=end
+        ).annotate(contact_count=Count("msgs__contact_id", distinct=True))
+        active_counts = {o.id: o.contact_count for o in active_counts}
+
+        # number of received msgs
+        incoming_count = Org.objects.filter(
+            is_active=True, msgs__created_on__gte=start, msgs__created_on__lt=end, msgs__direction="I"
+        ).annotate(msg_count=Count("id"))
+        incoming_count = {o.id: o.msg_count for o in incoming_count}
+
+        # number of sent messages
+        outgoing_count = Org.objects.filter(
+            is_active=True, msgs__created_on__gte=start, msgs__created_on__lt=end, msgs__direction="O"
+        ).annotate(msg_count=Count("id"))
+        outgoing_count = {o.id: o.msg_count for o in outgoing_count}
+
+        # calculate active count in plan period for orgs with an active plan
+        plan_active_contact_counts = dict()
+        for org in (
+            Org.objects.exclude(plan_end=None)
+            .exclude(plan_start=None)
+            .exclude(plan_end__lt=start)
+            .only("plan_start", "plan_end")
+        ):
+            plan_end = org.plan_end if org.plan_end < end else end
+            count = (
+                Msg.objects.filter(org=org, created_on__gt=org.plan_start, created_on__lt=plan_end)
+                .only("contact")
+                .distinct("contact")
+                .count()
+            )
+            plan_active_contact_counts[org.id] = count
+
+        for org in contact_counts:
+            OrgActivity.objects.update_or_create(
+                org=org,
+                day=start,
+                contact_count=org.contact_count,
+                active_contact_count=active_counts.get(org.id, 0),
+                incoming_count=incoming_count.get(org.id, 0),
+                outgoing_count=outgoing_count.get(org.id, 0),
+                plan_active_contact_count=plan_active_contact_counts.get(org.id),
+            )
+
+    class Meta:
+        unique_together = ("org", "day")

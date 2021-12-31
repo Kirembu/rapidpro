@@ -13,7 +13,7 @@ from ...views import ClaimViewMixin
 class ClaimView(ClaimViewMixin, SmartFormView):
     class MGClaimForm(ClaimViewMixin.Form):
         shortcode = forms.CharField(max_length=15, min_length=1, help_text=_("The Messangi short code"))
-        carrier_id = forms.IntegerField(label=_("Carrier Id"), help_text=_("The carrier id for the Shortcode"))
+        carrier_id = forms.IntegerField(label=_("Carrier Id"), help_text=_("The carrier id for the short code"))
         public_key = forms.CharField(
             max_length=30, min_length=1, label=_("Public Key"), help_text=_("The public key provided by Messangi")
         )
@@ -29,9 +29,6 @@ class ClaimView(ClaimViewMixin, SmartFormView):
         data = form.cleaned_data
         org = user.get_org()
 
-        if not org:  # pragma: no cover
-            raise Exception(_("No org for this user, cannot claim"))
-
         from .type import MessangiType
 
         config = {
@@ -42,7 +39,13 @@ class ClaimView(ClaimViewMixin, SmartFormView):
         }
 
         self.object = Channel.create(
-            org, user, "JM", "MG", name="Messangi: %s" % data["shortcode"], address=data["shortcode"], config=config
+            org,
+            user,
+            "JM",
+            self.channel_type,
+            name="Messangi: %s" % data["shortcode"],
+            address=data["shortcode"],
+            config=config,
         )
 
         return super(ClaimView, self).form_valid(form)

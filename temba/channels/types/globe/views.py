@@ -11,7 +11,7 @@ class ClaimView(AuthenticatedExternalClaimView):
             max_length=14,
             min_length=1,
             label=_("Number"),
-            help_text=_("The shortcode you have been assigned by Globe Labs " "ex: 15543"),
+            help_text=_("The short code you have been assigned by Globe Labs ex: 15543"),
         )
         app_id = forms.CharField(label=_("Application Id"), help_text=_("The id of your Globe Labs application"))
         app_secret = forms.CharField(
@@ -29,16 +29,13 @@ class ClaimView(AuthenticatedExternalClaimView):
     def form_valid(self, form):
         org = self.request.user.get_org()
 
-        if not org:  # pragma: no cover
-            raise Exception(_("No org for this user, cannot claim"))
-
         data = form.cleaned_data
         self.object = Channel.add_config_external_channel(
             org,
             self.request.user,
             "PH",
             data["number"],
-            "GL",
+            self.channel_type,
             dict(app_id=data["app_id"], app_secret=data["app_secret"], passphrase=data["passphrase"]),
             role=Channel.ROLE_SEND + Channel.ROLE_RECEIVE,
         )

@@ -1,3 +1,4 @@
+import contextlib
 from uuid import UUID
 
 import iso8601
@@ -10,9 +11,13 @@ from django.db import transaction
 from temba.api.models import APIPermission, SSLPermission
 from temba.api.support import InvalidQueryError
 from temba.contacts.models import URN
+from temba.utils import str_to_bool
+from temba.utils.views import NonAtomicMixin
+
+from .serializers import BulkActionFailure
 
 
-class BaseAPIView(generics.GenericAPIView):
+class BaseAPIView(NonAtomicMixin, generics.GenericAPIView):
     """
     Base class of all our API endpoints
     """
@@ -23,10 +28,6 @@ class BaseAPIView(generics.GenericAPIView):
     model_manager = "objects"
     lookup_params = {"uuid": "uuid"}
 
-    @transaction.non_atomic_requests
-    def dispatch(self, request, *args, **kwargs):
-        return super().dispatch(request, *args, **kwargs)
-
     def options(self, request, *args, **kwargs):
         """
         Disable the default behaviour of OPTIONS returning serializer fields since we typically have two serializers
@@ -34,9 +35,18 @@ class BaseAPIView(generics.GenericAPIView):
         """
         return self.http_method_not_allowed(request, *args, **kwargs)
 
-    def get_queryset(self):
+    def derive_queryset(self):
         org = self.request.user.get_org()
         return getattr(self.model, self.model_manager).filter(org=org)
+
+    def get_queryset(self):
+        qs = self.derive_queryset()
+
+        # if this is a get request, fetch from readonly database
+        if self.request.method == "GET":
+            qs = qs.using("readonly")
+
+        return qs
 
     def get_lookup_values(self):
         """
@@ -86,11 +96,13 @@ class BaseAPIView(generics.GenericAPIView):
         return context
 
     def normalize_urn(self, value):
-        if self.request.user.get_org().is_anon:
+        org = self.request.user.get_org()
+
+        if org.is_anon:
             raise InvalidQueryError("URN lookups not allowed for anonymous organizations")
 
         try:
-            return URN.identity(URN.normalize(value))
+            return URN.identity(URN.normalize(value, country_code=org.default_country_code))
         except ValueError:
             raise InvalidQueryError("Invalid URN: %s" % value)
 
@@ -145,18 +157,18 @@ class ListAPIMixin(mixins.ListModelMixin):
         page = super().paginate_queryset(queryset)
 
         # give views a chance to prepare objects for serialization
-        self.prepare_for_serialization(page)
+        self.prepare_for_serialization(page, using=queryset.db)
 
         return page
 
-    def prepare_for_serialization(self, page):
+    def prepare_for_serialization(self, page, using: str):
         """
         Views can override this to do things like bulk cache initialization of result objects
         """
         pass
 
 
-class WriteAPIMixin(object):
+class WriteAPIMixin:
     """
     Mixin for any endpoint which can create or update objects with a write serializer. Our approach differs a bit from
     the REST framework default way as we use POST requests for both create and update operations, and use separate
@@ -164,6 +176,7 @@ class WriteAPIMixin(object):
     """
 
     write_serializer_class = None
+    write_with_transaction = True
 
     def post_save(self, instance):
         """
@@ -187,7 +200,8 @@ class WriteAPIMixin(object):
         serializer = self.write_serializer_class(instance=instance, data=request.data, context=context)
 
         if serializer.is_valid():
-            with transaction.atomic():
+            mgr = transaction.atomic() if self.write_with_transaction else contextlib.suppress()
+            with mgr:
                 output = serializer.save()
                 self.post_save(output)
                 return self.render_write_response(output, context)
@@ -203,7 +217,7 @@ class WriteAPIMixin(object):
         return Response(response_serializer.data, status=status_code)
 
 
-class BulkWriteAPIMixin(object):
+class BulkWriteAPIMixin:
     """
     Mixin for a bulk action endpoint which writes multiple objects in response to a POST but returns nothing.
     """
@@ -212,8 +226,11 @@ class BulkWriteAPIMixin(object):
         serializer = self.serializer_class(data=request.data, context=self.get_serializer_context())
 
         if serializer.is_valid():
-            serializer.save()
-            return Response("", status=status.HTTP_204_NO_CONTENT)
+            result = serializer.save()
+            if isinstance(result, BulkActionFailure):
+                return Response(result.as_json(), status.HTTP_200_OK)
+            else:
+                return Response("", status=status.HTTP_204_NO_CONTENT)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -236,7 +253,7 @@ class DeleteAPIMixin(mixins.DestroyModelMixin):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     def perform_destroy(self, instance):
-        instance.release()
+        instance.release(self.request.user)
 
 
 class CreatedOnCursorPagination(CursorPagination):
@@ -245,5 +262,15 @@ class CreatedOnCursorPagination(CursorPagination):
 
 
 class ModifiedOnCursorPagination(CursorPagination):
-    ordering = ("-modified_on", "-id")
+    def get_ordering(self, request, queryset, view):
+        if str_to_bool(request.GET.get("reverse")):
+            return "modified_on", "id"
+        else:
+            return "-modified_on", "-id"
+
+    offset_cutoff = 1000000
+
+
+class DateJoinedCursorPagination(CursorPagination):
+    ordering = ("-date_joined", "-id")
     offset_cutoff = 1000000

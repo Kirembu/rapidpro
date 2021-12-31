@@ -1,5 +1,7 @@
+import json
 from datetime import timedelta
 
+import iso8601
 import pytz
 
 from django import template
@@ -12,7 +14,10 @@ from django.utils.html import escapejs
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext, ugettext_lazy as _, ungettext_lazy
 
-from ...campaigns.models import Campaign
+from temba.utils.dates import datetime_to_str
+
+from ...campaigns.models import Campaign, CampaignEvent
+from ...contacts.models import ContactGroup
 from ...flows.models import Flow
 from ...triggers.models import Trigger
 
@@ -27,6 +32,19 @@ TIME_SINCE_CHUNKS = (
 )
 
 
+OBJECT_URLS = {
+    Flow: lambda o: reverse("flows.flow_editor", args=[o.uuid]),
+    Campaign: lambda o: reverse("campaigns.campaign_read", args=[o.id]),
+    CampaignEvent: lambda o: reverse("campaigns.campaign_read", args=[o.id]),
+    ContactGroup: lambda o: reverse("contacts.contact_filter", args=[o.uuid]),
+}
+
+
+@register.filter
+def object_class_name(obj):
+    return obj.__class__.__name__
+
+
 @register.filter
 def oxford(forloop, punctuation=""):
     """
@@ -34,11 +52,11 @@ def oxford(forloop, punctuation=""):
     """
     # there are only two items
     if forloop["counter"] == 1 and forloop["revcounter"] == 2:
-        return _(" and ")
+        return f' {_("and")} '
 
     # we are the last in a list of 3 or more
     if forloop["revcounter"] == 2:
-        return _(", and ")
+        return f', {_("and")} '
 
     if not forloop["last"]:
         return ", "
@@ -49,15 +67,22 @@ def oxford(forloop, punctuation=""):
 def icon(o):
 
     if isinstance(o, Campaign):
-        return "icon-instant"
+        return "icon-campaign"
 
     if isinstance(o, Trigger):
         return "icon-feed"
 
     if isinstance(o, Flow):
-        return "icon-tree"
+        return "icon-flow"
 
     return ""
+
+
+@register.filter
+def object_url(o):
+    assert type(o) in OBJECT_URLS
+
+    return OBJECT_URLS[type(o)](o)
 
 
 @register.filter
@@ -77,6 +102,15 @@ def format_seconds(seconds):
     if seconds >= 30:
         minutes += 1
     return "%s min" % minutes
+
+
+@register.simple_tag()
+def annotated_field(field, label, help_text):
+    attrs = field.field.widget.attrs
+    attrs["label"] = label
+    attrs["help_text"] = help_text
+    attrs["errors"] = json.dumps([str(error) for error in field.errors])
+    return field.as_widget(attrs=attrs)
 
 
 @register.simple_tag(takes_context=True)
@@ -99,9 +133,9 @@ def non_ssl_brand_url(context, url_name, args=None):
         hostname = context["brand"].get("domain", settings.HOSTNAME)
 
     path = reverse(url_name, args)
-    if settings.HOSTNAME != "localhost":
+    if settings.HOSTNAME != "localhost":  # pragma: needs cover
         return "http://%s%s" % (hostname, path)
-    return path  # pragma: needs cover
+    return path
 
 
 @register.filter("delta", is_safe=False)
@@ -125,7 +159,7 @@ def delta_filter(delta):
             seconds2, name2 = TIME_SINCE_CHUNKS[i + 1]
             count2 = (since - (seconds * count)) // seconds2
             if count2 != 0:
-                result += ugettext(", ") + name2 % count2
+                result += ", " + name2 % count2
         return result
 
     except Exception:
@@ -176,39 +210,6 @@ def to_json(value):
 
 
 @register.simple_tag(takes_context=True)
-def pretty_datetime(context, dtime):
-
-    if dtime.tzinfo is None:
-        dtime = dtime.replace(tzinfo=pytz.utc)
-    org_format = "D"
-    tz = pytz.UTC
-    org = context["user_org"]
-    if org:
-        org_format = org.date_format
-        tz = org.timezone
-
-    dtime = dtime.astimezone(tz)
-
-    if org_format == "D":
-        return "%d %s %s %s:%s" % (
-            int(dtime.strftime("%d")),
-            dtime.strftime("%B"),
-            dtime.strftime("%Y"),
-            dtime.strftime("%H"),
-            dtime.strftime("%M"),
-        )
-    else:
-        return "%s %d, %s %d:%s %s" % (
-            dtime.strftime("%B"),
-            int(dtime.strftime("%d")),
-            dtime.strftime("%Y"),
-            int(dtime.strftime("%I")),
-            dtime.strftime("%M"),
-            dtime.strftime("%p").lower(),
-        )
-
-
-@register.simple_tag(takes_context=True)
 def short_datetime(context, dtime):
     if dtime.tzinfo is None:
         dtime = dtime.replace(tzinfo=pytz.utc)
@@ -227,15 +228,46 @@ def short_datetime(context, dtime):
 
     if org_format == "D":
         if dtime > twelve_hours_ago:
-            return "%s:%s" % (dtime.strftime("%H"), dtime.strftime("%M"))
+            return f"{dtime.strftime('%H')}:{dtime.strftime('%M')}"
         elif now.year == dtime.year:
-            return "%d %s" % (int(dtime.strftime("%d")), dtime.strftime("%b"))
+            return f"{int(dtime.strftime('%d'))} {dtime.strftime('%b')}"
         else:
-            return "%d/%d/%s" % (int(dtime.strftime("%d")), int(dtime.strftime("%m")), dtime.strftime("%y"))
+            return f"{int(dtime.strftime('%d'))}/{int(dtime.strftime('%m'))}/{dtime.strftime('%y')}"
+    elif org_format == "Y":
+        if dtime > twelve_hours_ago:
+            return f"{dtime.strftime('%H')}:{dtime.strftime('%M')}"
+        elif now.year == dtime.year:
+            return f"{dtime.strftime('%b')} {int(dtime.strftime('%d'))}"
+        else:
+            return f"{dtime.strftime('%Y')}/{int(dtime.strftime('%m'))}/{int(dtime.strftime('%d'))}"
+
     else:
         if dtime > twelve_hours_ago:
-            return "%d:%s %s" % (int(dtime.strftime("%I")), dtime.strftime("%M"), dtime.strftime("%p").lower())
+            return f"{int(dtime.strftime('%I'))}:{dtime.strftime('%M')} {dtime.strftime('%p').lower()}"
         elif now.year == dtime.year:
-            return "%s %d" % (dtime.strftime("%b"), int(dtime.strftime("%d")))
+            return f"{dtime.strftime('%b')} {int(dtime.strftime('%d'))}"
         else:
-            return "%d/%d/%s" % (int(dtime.strftime("%m")), int(dtime.strftime("%d")), dtime.strftime("%y"))
+            return f"{int(dtime.strftime('%m'))}/{int(dtime.strftime('%d'))}/{dtime.strftime('%y')}"
+
+
+@register.simple_tag(takes_context=True)
+def format_datetime(context, dt, seconds: bool = False):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=pytz.utc)
+
+    tz = pytz.UTC
+    org = context.get("user_org")
+    if org:
+        tz = org.timezone
+    dt = dt.astimezone(tz)
+
+    if org:
+        return org.format_datetime(dt, seconds=seconds)
+
+    fmt = "%d-%m-%Y %H:%M:%S" if seconds else "%d-%m-%Y %H:%M"
+    return datetime_to_str(dt, fmt, tz)
+
+
+@register.filter
+def parse_isodate(value):
+    return iso8601.parse_date(value)

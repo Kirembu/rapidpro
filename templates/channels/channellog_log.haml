@@ -1,30 +1,36 @@
--load humanize
+-load humanize channels i18n
 
-.log<
-  .summary{id:"{{log.id}}"}
-    .time.pull-right
-      {{log.created_on|date:"M j, Y g:i:s a"}}
+%table.list.mb-4
+  %tbody
+    %tr.border-b
+      %td(style="width: 30px;")
+        .font-normal.text-2xl
+          {{ log.response_status }}
 
+      %td
+        .font-normal.inline.mr-1
+          %span.method= log.method
+        .break-all(style="min-width:200px")
+          {% channellog_url log %}
 
-    .request-time.pull-right
-      -if log.request_time
-        Request time:
-        %span.request-time-value
-          {{ log.request_time|default:"0"|intcomma }}ms
+      %td
+        .text-right.whitespace-nowrap
+          -if log.request_time
+            -trans "Took"
+            %span.request-time-value
+              {{ log.request_time|default:"0"|intcomma }}ms
+      %td
+        .text-right.whitespace-nowrap
+          {% format_datetime log.created_on seconds=True %}
 
-    -if log.response_status
-      %span.status-code
-        {{ log.response_status }}
-    %span.url
-      %span.method= log.method
-      -if log.method == 'GET'
-        {{ log.get_url_host }}
-      -else
-        {{ log.url }}
-  .details.hide
-    %pre.prettyprint.request<
-      :plain
-        {{ log.get_request_formatted|default:"" }}
-    %pre.prettyprint.response<
-      :plain
-        {{log.get_response_formatted}}
+    %tr
+      %td(colspan="4" style="padding:0;")
+        %pre.prettyprint.request<
+          :plain
+            {% channellog_request log %}
+
+    %tr
+      %td(colspan="4" style="padding:0;")
+        %pre.prettyprint.response<
+          :plain
+            {% channellog_response log %}

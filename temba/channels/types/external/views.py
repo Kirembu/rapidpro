@@ -2,20 +2,20 @@ from smartmin.views import SmartFormView
 
 from django import forms
 from django.core.validators import MaxValueValidator, MinValueValidator
+from django.forms import ValidationError
 from django.utils.translation import ugettext_lazy as _
 
-from temba.contacts.models import TEL_SCHEME, TWITTER_SCHEME, ContactURN
+from temba.contacts.models import URN
+from temba.utils.fields import ExternalURLField, SelectMultipleWidget, SelectWidget
 
 from ...models import Channel
-from ...views import ALL_COUNTRIES, ClaimViewMixin
+from ...views import ALL_COUNTRIES, ClaimViewMixin, UpdateTelChannelForm
 
 
 class ClaimView(ClaimViewMixin, SmartFormView):
     class ClaimForm(ClaimViewMixin.Form):
         scheme = forms.ChoiceField(
-            choices=ContactURN.SCHEME_CHOICES,
-            label=_("URN Type"),
-            help_text=_("The type of URNs handled by this channel"),
+            choices=URN.SCHEME_CHOICES, label=_("URN Type"), help_text=_("The type of URNs handled by this channel")
         )
 
         number = forms.CharField(
@@ -24,14 +24,6 @@ class ClaimView(ClaimViewMixin, SmartFormView):
             label=_("Number"),
             required=False,
             help_text=_("The phone number or that this channel will send from"),
-        )
-
-        handle = forms.CharField(
-            max_length=32,
-            min_length=1,
-            label=_("Handle"),
-            required=False,
-            help_text=_("The Twitter handle that this channel will send from"),
         )
 
         address = forms.CharField(
@@ -46,6 +38,7 @@ class ClaimView(ClaimViewMixin, SmartFormView):
             choices=ALL_COUNTRIES,
             label=_("Country"),
             required=False,
+            widget=SelectWidget(attrs={"searchable": True}),
             help_text=_("The country this phone number is used in"),
         )
 
@@ -66,13 +59,20 @@ class ClaimView(ClaimViewMixin, SmartFormView):
 
         max_length = forms.IntegerField(
             initial=160,
-            validators=[MaxValueValidator(640), MinValueValidator(60)],
+            validators=[MaxValueValidator(6400), MinValueValidator(60)],
             help_text=_(
                 "The maximum length of any single message on this channel. " "(longer messages will be split)"
             ),
         )
 
-        url = forms.URLField(
+        send_authorization = forms.CharField(
+            max_length=2048,
+            label=_("Authorization Header Value"),
+            required=False,
+            help_text=_("The Authorization header value added when calling the URL (if any)"),
+        )
+
+        url = ExternalURLField(
             max_length=1024,
             label=_("Send URL"),
             help_text=_("The URL we will call when sending messages, with variable substitutions"),
@@ -94,8 +94,16 @@ class ClaimView(ClaimViewMixin, SmartFormView):
             help_text=_("The content that must be in the response to consider the request successful"),
         )
 
+        def clean(self):
+            cleaned_data = super().clean()
+            scheme = cleaned_data.get("scheme")
+            if scheme == URN.TEL_SCHEME and not cleaned_data.get("number"):
+                raise ValidationError({"number": _("This field is required.")})
+            elif scheme != URN.TEL_SCHEME and not cleaned_data.get("address"):
+                raise ValidationError({"address": _("This field is required.")})
+
     class SendClaimForm(ClaimViewMixin.Form):
-        url = forms.URLField(
+        url = ExternalURLField(
             max_length=1024,
             label=_("Send URL"),
             help_text=_("The URL we will POST to when sending messages, with variable substitutions"),
@@ -118,10 +126,17 @@ class ClaimView(ClaimViewMixin, SmartFormView):
 
         max_length = forms.IntegerField(
             initial=160,
-            validators=[MaxValueValidator(640), MinValueValidator(60)],
+            validators=[MaxValueValidator(6400), MinValueValidator(60)],
             help_text=_(
                 "The maximum length of any single message on this channel. " "(longer messages will be split)"
             ),
+        )
+
+        send_authorization = forms.CharField(
+            max_length=2048,
+            label=_("Authorization Header Value"),
+            required=False,
+            help_text=_("The Authorization header value added when calling the URL (if any)"),
         )
 
         body = forms.CharField(
@@ -145,7 +160,9 @@ class ClaimView(ClaimViewMixin, SmartFormView):
     success_url = "uuid@channels.channel_configuration"
 
     def derive_initial(self):
-        return {"body": Channel.CONFIG_DEFAULT_SEND_BODY}
+        from .type import ExternalType
+
+        return {"body": ExternalType.CONFIG_DEFAULT_SEND_BODY, "scheme": URN.TEL_SCHEME}
 
     def get_form_class(self):
         if self.request.GET.get("role", None) == "S":  # pragma: needs cover
@@ -154,26 +171,25 @@ class ClaimView(ClaimViewMixin, SmartFormView):
             return ClaimView.ClaimForm
 
     def form_valid(self, form):
+        from .type import ExternalType
+
         org = self.request.user.get_org()
         data = form.cleaned_data
 
         if self.request.GET.get("role", None) == "S":  # pragma: needs cover
             # get our existing channel
-            receive = org.get_receive_channel(TEL_SCHEME)
+            receive = org.get_receive_channel(URN.TEL_SCHEME)
             role = Channel.ROLE_SEND
-            scheme = TEL_SCHEME
+            scheme = URN.TEL_SCHEME
             address = receive.address
             country = receive.country
         else:
             role = Channel.ROLE_SEND + Channel.ROLE_RECEIVE
             scheme = data["scheme"]
-            if scheme == TEL_SCHEME:
+            if scheme == URN.TEL_SCHEME:
                 address = data["number"]
                 country = data["country"]
-            elif scheme == TWITTER_SCHEME:  # pragma: needs cover
-                address = data["handle"]
-                country = None
-            else:  # pragma: needs cover
+            else:
                 address = data["address"]
                 country = None
 
@@ -185,20 +201,39 @@ class ClaimView(ClaimViewMixin, SmartFormView):
 
         config = {
             Channel.CONFIG_SEND_URL: data["url"],
-            Channel.CONFIG_SEND_METHOD: data["method"],
-            Channel.CONFIG_CONTENT_TYPE: data["content_type"],
-            Channel.CONFIG_MAX_LENGTH: data["max_length"],
+            ExternalType.CONFIG_SEND_METHOD: data["method"],
+            ExternalType.CONFIG_CONTENT_TYPE: data["content_type"],
+            ExternalType.CONFIG_MAX_LENGTH: data["max_length"],
             Channel.CONFIG_ENCODING: data.get("encoding", Channel.ENCODING_DEFAULT),
         }
 
+        if "send_authorization" in data:
+            config[ExternalType.CONFIG_SEND_AUTHORIZATION] = data["send_authorization"]
+
         if "body" in data:
-            config[Channel.CONFIG_SEND_BODY] = data["body"]
+            config[ExternalType.CONFIG_SEND_BODY] = data["body"]
 
         if "mt_response_check" in data:
-            config[Channel.CONFIG_MT_RESPONSE_CHECK] = data["mt_response_check"]
+            config[ExternalType.CONFIG_MT_RESPONSE_CHECK] = data["mt_response_check"]
 
         self.object = Channel.add_config_external_channel(
             org, self.request.user, country, address, self.channel_type, config, role, [scheme], parent=channel
         )
 
         return super().form_valid(form)
+
+
+class UpdateForm(UpdateTelChannelForm):
+    role = forms.MultipleChoiceField(
+        choices=((Channel.ROLE_RECEIVE, _("Receive")), (Channel.ROLE_SEND, _("Send"))),
+        widget=SelectMultipleWidget(attrs={"widget_only": True}),
+        label=_("Channel Role"),
+        help_text=_("The roles this channel can fulfill"),
+    )
+
+    def clean_role(self):
+        return "".join(self.cleaned_data.get("role", []))
+
+    class Meta(UpdateTelChannelForm.Meta):
+        fields = "name", "alert_email", "role"
+        readonly = []

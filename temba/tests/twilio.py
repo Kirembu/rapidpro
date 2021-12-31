@@ -1,6 +1,5 @@
 from twilio.request_validator import RequestValidator
-
-from temba.ivr.clients import TwilioClient
+from twilio.rest import Client
 
 
 class MockRequestValidator(RequestValidator):
@@ -11,7 +10,7 @@ class MockRequestValidator(RequestValidator):
         return True
 
 
-class MockTwilioClient(TwilioClient):
+class MockTwilioClient(Client):
     def __init__(self, sid, token, org=None, base=None):
         self.org = org
         self.base = base
@@ -108,9 +107,10 @@ class MockTwilioClient(TwilioClient):
             self.sid = "TwilioTestSid"
 
     class MockPhoneNumber(MockInstanceResource):
-        def __init__(self, phone_number):
+        def __init__(self, phone_number, sms=True, voice=True):
             self.phone_number = phone_number
             self.sid = "PhoneNumberSid"
+            self.capabilities = dict(sms=sms, voice=voice)
 
     class MockAccount(MockInstanceResource):
         def __init__(self, account_type, auth_token="AccountToken"):

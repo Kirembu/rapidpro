@@ -1,6 +1,5 @@
 -extends "smartmin/list.html"
--load smartmin sms contacts temba
--load i18n humanize
+-load smartmin sms contacts temba i18n humanize
 
 -block page-title
   -if current_group
@@ -9,291 +8,34 @@
     {{title}}
 
 -block page-top
-  {% render as page_top %}
-    {{block.super}}
-  {% endrender %}
-  -if has_contacts
-    {{page_top}}
 
 -block title-icon
   %span.title-icon
     .glyph.icon-users
 
--block above-bar
-  -block top-form
-    %form{method:'get'}
-      %input.input-medium.search-query{'type':'text', 'placeholder':'{% trans "Search" %}', 'name':"search", 'value':"{{search}}"}
-
--block content
-  #pjax
-    -block pjax
-      .row-fluid
-        .span3.sidebox
-          %div.contacts{style:"margin-bottom: 10px"}
-            - if org_perms.contacts.contact_import
-              %a#id_import_contacts.btn.btn-primary.btn-block{href:"{% url 'contacts.contact_import' %}"}
-                -trans "Import Contacts"
-
-          #sidebar-nav
-            %ul.nav.nav-list
-              %li.nav-header
-                -trans "Contacts"
-              - for folder in folders
-                %li{'class':'{% if request.path == folder.url %}active{% endif %}'}
-                  %a{'href':'{{folder.url}}'}
-                    {{folder.label}} ({{ folder.count | intcomma }})
-
-              %li.nav-header
-                -trans "Groups"
-              - for group in groups
-                %li{'class':'{% if current_group.id == group.pk %}active{% endif %}'}
-                  %a{'href':'{% url "contacts.contact_filter" group.uuid %}'}
-                    -if group.is_ready
-                      {{group.label}} ({{ group.count | intcomma }})
-                    -else
-                      {{group.label}}
-                      %i.spin.icon-loop
-
-          %div{style:"margin-top: 10px"}
-            - if org_perms.contacts.contact_create
-              %a#add-contact.btn.btn-block
-                -trans "Create Contact"
-            - if org_perms.contacts.contactgroup_create
-              %a#id_add_group.btn.btn-block
-                -trans "Create Group"
-
-        - if has_contacts
-          - block contacts-list
-            .span9
-
-              - block buttons
-
-                .pull-right
-                  -block buttons-right
-                    -block gear-menu
-                      -include "gear_links_include.haml"
-
-                - if org_perms.contacts.contact_update
-                  .list-buttons-container
-                    .list-buttons
-                      - if 'block' in actions
-                        %span.btn-group
-                          %a.object-btn-block{'href':'#'}
-                            %button.btn
-                              .glyph.icon-user-block
-                              -trans "Block"
-
-                      - if 'unblock' in actions
-                        %span.btn-group
-                          %a.object-btn-unblock{'href':'#'}
-                            %button.btn
-                              .glyph.icon-user
-                              -trans "Unblock"
-
-                      - if 'unstop' in actions
-                        %span.btn-group
-                          %a.object-btn-unstop{'href':'#'}
-                            %button.btn
-                              .glyph.icon-user
-                              -trans "Unstop"
-
-                      - if 'delete' in actions
-                        %span.btn-group
-                          %a.contacts-btn-delete{'href':'#'}
-                            %button.btn
-                              .glyph.icon-user-delete
-                              -trans "Delete"
-
-                      - if 'unlabel' in actions
-                        %span.btn-group
-                          %a{'href':'#', onclick:'unlabelObjectRows({{current_group.pk}})'}
-                            %button.btn{data-toggle:'tooltip', data-trigger:'hover', data-delay:"800", data-placement:'top', data-original-title:'{% trans "Remove from Group" %}'}
-                              .glyph.icon-user-remove
-
-                      - if 'label' in actions
-                        %span.btn-group
-                          %button.btn.dropdown-toggle{'data-toggle':"dropdown", data-trigger:'hover', data-delay:"800", data-placement:'top', data-original-title:'{% trans "Contact Groups" %}'}
-                            .glyph.icon-users-2
-                            %span.caret
-                          %ul.dropdown-menu.label-menu
-                            - for group in groups
-                              - if not group.is_dynamic
-                                %li
-                                  %a.lbl-menu{'href':'#', onclick:'addContactToGroup({{group.pk}})', data-id:'{{group.pk}}'}
-                                    .glyph.label-checkbox
-                                    = group.label
-                            - if org_perms.contacts.contactgroup_create
-                              - if groups
-                                %li.divider
-                              %li
-                                %a.lbl-menu.add-group{ href:'#' }
-                                  - trans "New Group..."
-
-                      - if org_perms.msgs.broadcast_send and not reply_disabled
-                        %span.btn-group
-                          %button.send-button.btn{data-toggle:'tooltip', data-trigger:'hover', data-delay:"800", data-placement:'top', data-original-title:'{% trans "Send Message" %}'}
-                            .glyph.icon-bubble-replu
-
-              .search-details
-                -if search_error
-                  %span.search-error
-                    =search_error
-                -elif search
-                  -blocktrans with results_count=paginator.count|intcomma count cc=paginator.count
-                    Found {{ results_count }} contact matching <i>{{search}}</i>.
-                    -plural
-                      Found {{ results_count }} contacts matching <i>{{search}}</i>.
-
-              .list-container
-                %table.list-table.contact_list.table.object-list.table.table-condensed{style: '{% if not org_perms.contacts.contact_update %}margin-top:10px{% endif %}'}
-                  %tr.contacts
-                    - if org_perms.contacts.contact_update
-                      %th
-
-                    %th
-                    %th
-                    -for field in contact_fields
-                      -if field.show_in_table
-                        %th
-                          -if sort_field == field.uuid|stringformat:'s'
-                            -if sort_direction == 'desc'
-                              %a{href:"?sort_on={{ field.uuid }}{% if search %}&search={{ search|escape }}{% endif %}"}
-                                %div
-                                  {{ field.label }}
-                                  %span.sort.icon.icon-arrow-down-2.sort-asc.visible
-                            -else
-                              %a{href:"?sort_on=-{{ field.uuid }}{% if search %}&search={{ search|escape }}{% endif %}"}
-                                %div
-                                  {{ field.label }}
-                                  %span.sort.icon.icon-arrow-up5.sort-desc.visible
-                          -else
-                            %a{href:"?sort_on=-{{ field.uuid }}{% if search %}&search={{ search|escape }}{% endif %}"}
-                              %div
-                                {{ field.label }}
-                                %span.sort.icon.icon-arrow-down-2.sort-desc
-                    %th
-                      - if object_list
-
-                        -if sort_field == 'created_on'
-                          -if sort_direction == 'desc'
-                            %a{href:"?sort_on=created_on{% if search %}&search={{ search|escape }}{% endif %}"}
-                              %div
-                                -trans "Created On"
-                                %span.sort.icon.icon-arrow-down-2.sort-asc.visible
-                          -else
-                            %a{href:"?sort_on=-created_on{% if search %}&search={{ search|escape }}{% endif %}"}
-                              %div
-                                -trans "Created On"
-                                %span.sort.icon.icon-arrow-up5.sort-desc.visible
-                        -else
-                          %a{href:"?sort_on=-created_on{% if search %}&search={{ search|escape }}{% endif %}"}
-                            %div
-                              -trans "Created On"
-                              %span.sort.icon.icon-arrow-down-2.sort-desc
-
-                  %tbody
-                    - for object in contacts
-                      %tr.contact.select-row.object-row{'class':'{% cycle row1 row2 %}', 'data-uuid': '{{object.uuid}}', 'data-object-id':'{{object.id}}'}
-
-                        - if org_perms.contacts.contact_update or org_perms.msgs.broadcast_send
-                          %td.contact.checkbox.object-row-checkbox
-                            .glyph.icon-checkbox-unchecked.contact-checkbox.object-row-checkbox
-
-                        %td.value-text.field_name
-                          {{ object|name:user_org }}
-
-                        %td.value-phone.field_phone
-                          %nobr
-                            {{ object|urn:user_org }}
-
-                        -for field in contact_fields
-                          -if field.show_in_table
-                            %td.field
-                              {{ object|contact_field:field.key }}
-
-                        %td.value-received.field_received
-                          %nobr
-                            {% short_datetime object.created_on %}
-
-                        // This is needed for action buttons
-                        %td.hide
-                          .value-labels
-                            %nobr
-                              - for group in object.all_groups.all
-                                - if group.group_type == 'U'
-                                  %span.label.label-info.lbl{ data-id: '{{group.id}}'}
-                                    %a{'href':'{% url "contacts.contact_filter" group.uuid %}'}
-                                      {{group.name}}
-
-                    -empty
-                      %tr
-                        %td{colspan:3}
-                          -trans "No matching contacts."
-                        -for field in contact_fields
-                          -if field.show_in_table
-                            %td.field
-                        %td
-
-
-              - block paginator
-                - if object_list.count
-                  .paginator
-                    - include "smartmin/sidebar_pagination.haml"
-
-        - else
-          - include "contacts/empty_include.haml"
-
--block post-content
-  - if org_perms.msgs.broadcast_send and not reply_disabled
-    - include "msgs/msg_send_modal.haml"
-
-  -if org_perms.contacts.contact_delete
-    .contact-deletion.hide
-      .title
-        -trans "Delete Contacts"
-
-      .body
-        %p
-          -trans "Are you sure you want to delete these contacts?"
-        %p
-          -trans "Once they are deleted, they will be gone forever. There is no way to undo this operation."
-
 -block extra-style
-  :css
+   {{block.super}}
+   :css
     tr.contacts th a span.icon {
       visibility: hidden;
       text-decoration: none;
       font-size: 14px;
       margin-top: -1px;
     }
+
     tr.contacts th a {
       text-decoration: none;
-      font-weight:200;
-      color: #aaa;
+      font-weight:500;
+      color: #717171;
+      font-size: 0.75rem;
     }
+
     tr.contacts th:hover a span.icon {
       visibility: visible;
       font-size: 14px;
     }
     tr.contacts th a span.icon.visible {
       visibility: visible;
-    }
-    tr.contacts th {
-      font-size:11px;
-      height:10px;
-      padding:0;
-      padding-top:10px;
-      padding-left:14px;
-      font-weight:200;
-      color: #aaa;
-      border:0px solid;
-      text-align:center;
-      white-space: nowrap;
-    }
-
-    td.field {
-      text-align:center;
-      min-width:125px;
     }
 
     .span9 .contact_list tr.contacts {
@@ -312,207 +54,303 @@
       color: #da4f49;
     }
 
+    .pagination-notification {
+      background: #ecf0f1;
+      padding: 10px;
+    }
+
+-block content
+  #pjax
+    -block pjax
+      -if org_perms.contacts.contact_delete
+        %temba-dialog#delete-confirmation.hide(header='{{ _("Delete Selected Contacts")|escapejs }}' primaryButtonName='{{ _("Delete")|escapejs }}' destructive='true')
+          .p-6
+            -trans "Are you sure you want to delete the selected contacts? This cannot be undone."
+
+        %temba-dialog#delete-all-confirmation.hide(header='{{ _("Delete All Contacts")|escapejs }}' primaryButtonName='{{ _("Delete")|escapejs }}' destructive='true')
+          .p-6
+            -blocktrans trimmed with count=paginator.count
+              Are you sure you want to delete all {{ count }} archived contacts? This cannot be undone.
+
+            -if paginator.count > 50
+              %br
+              %br
+              -blocktrans trimmed
+                This operation can take a while to complete. Contacts may remain in this view during the process.
+
+      .lp-frame
+        .left
+          -if org_perms.contacts.contactimport_create
+            .button-primary.block(onclick="goto(event)" href="{% url 'contacts.contactimport_create' %}")
+              -trans "Import Contacts"
+
+          .lp-nav.upper
+            -for folder in folders
+              .lp-nav-item(class="{% if request.path == folder.url %}font-normal selected{% endif %}")
+                .name(onclick="goto(event)" href='{{folder.url}}')
+                  {{folder.label}}
+                .count(onclick="goto(event)" href='{{folder.url}}')
+                  {{ folder.count | intcomma }}
+          
+          .secondary-buttons.mb-6
+            -if org_perms.contacts.contact_create
+              %temba-modax#create-label-modal(header='{% trans "Create Contact" %}' endpoint="{% url 'contacts.contact_create' %}")
+                .button-light.block.mt-3
+                  -trans "Create Contact"
+
+            -if org_perms.contacts.contactgroup_create
+              %temba-modax#create-group-modal(header='{% trans "Create Group" %}' endpoint="{% url 'contacts.contactgroup_create' %}" -temba-loaded="handleCreateGroupModalLoaded")
+                .button-light.block.mt-3
+                  -trans "Create Group"
+
+          .lp-nav.upper
+            .font-normal.uppercase.text-xs.pb-1.text-gray-500
+              -trans "Smart Groups"
+            .inner-scroll
+              -for group in groups
+                -if group.is_dynamic
+                  .lp-nav-item(onclick="goto(event)" href='{% url "contacts.contact_filter" group.uuid %}' class="{% if current_group.id == group.pk %}font-normal selected{% endif %}")
+                    .name.pointer-events-none
+                      {{group.label}}
+                    .count.pointer-events-none
+                      {{ group.count | intcomma }}
+
+          .lp-nav.lower
+            .font-normal.uppercase.text-xs.text-gray-500.pb-1
+              -trans "Groups"
+            .inner-scroll
+              -for group in groups
+                -if not group.is_dynamic
+                  .lp-nav-item(class="{% if current_group.id == group.pk %}font-normal selected{% endif %}")
+                    .name(onclick="goto(event)" href='{% url "contacts.contact_filter" group.uuid %}')
+                      {{group.label}}
+                    .count(onclick="goto(event)" href='{% url "contacts.contact_filter" group.uuid %}')
+                      {{ group.count | intcomma }}
+
+          .flex-grow
+        .right.overflow-x-hidden.p-2.-mt-1
+          -if has_contacts
+            -block contacts-list
+              .flex.w-full.items-end.flex-wrap.justify-end.mb-4
+                -block action-buttons
+                  -if org_perms.contacts.contact_update
+                    .list-buttons-container.h-full.mr-2.flex-grow
+                      .list-buttons.flex.items-center.-mx-2.h-full
+
+                        -if 'restore' in actions
+                          .button-action(onclick='runActionOnObjectRows("restore")')
+                            .-mt-1.mr-2.glyph.icon-checkmark
+                            -trans "Activate"
+
+                        -if 'block' in actions
+                          .button-action(onclick='runActionOnObjectRows("block")')
+                            .-mt-1.mr-2.glyph.icon-user-block
+                            -trans "Block"
+
+                        -if 'archive' in actions
+                          .button-action(onclick='runActionOnObjectRows("archive")')
+                            .-mt-1.mr-2.glyph.icon-box
+                            -trans "Archive"
+
+                        -if 'delete' in actions
+                          .button-action(onclick='onDeleteClicked()')
+                            .-mt-1.mr-2.glyph.icon-user-delete
+                            -trans "Delete"
+
+                        -if 'unlabel' in actions
+                          .button-action(onclick="unlabelObjectRows({{current_group.pk}});")
+                            .-mt-1.mr-2.glyph.icon-user-remove
+                            -trans "Remove From Group"
+
+                        -if 'label' in actions
+                          .btn-group
+                            .button-action.dropdown-toggle(data-toggle="dropdown" data-delay="800")
+                              .-mt-1.mr-2.glyph.icon-users-2(style="width:16px")
+                              -trans "Groups"
+
+                            %ul.dropdown-menu.label-menu.rounded-lg.border-none.px-4.py-3
+                              -for group in groups
+                                -if not group.is_dynamic
+                                  %li
+                                    .lbl-menu(href='#' onclick='addContactToGroup({{group.pk}})' data-id='{{group.pk}}')
+                                      .flex.items-center.py-1.hover-linked
+                                        .glyph.message-label.label-checkbox
+                                        .name.px-2
+                                          {{ group.label }}
+                              - if org_perms.contacts.contactgroup_create
+                                - if groups
+                                  %li.separator.-mx-4.border-b.my-3
+                                %li
+                                  .lbl-menu.add-group.hover-linked(onclick="handleAddGroupClicked()")
+                                    - trans "New Group..."
+
+                        -if org_perms.msgs.broadcast_send and not reply_disabled
+                          %temba-modax#send-message-modal(header='{{_("Send Message")|escapejs}}' endpoint="{% url 'msgs.broadcast_send' %}")
+                            .button-action.no-loading(onclick="handleSendMessageClicked()")
+                              .mr-2.glyph.icon-bubble-3(style="font-size:14px")
+                              -trans "Send"
+
+                  .flex-grow.ml-1.self-end.items-end
+                    .flex.flex-col.pr-12
+                      .page-title.leading-tight
+                        -block title
+                          -if current_group
+                            {{current_group.name}}
+                          -else
+                            {{title}}
+                  -if view.get_gear_links
+                    .gear-links
+                      -include "gear_links_include.haml"
+                .subtitle.ml-1.w-full
+                  -block subtitle
+
+
+              %form#search-form.mb-4(method="get")
+                %temba-textinput.w-full(placeholder='{% trans "Search" %}' name="search" value="{{search}}")
+
+              -if search_error
+                .mb-4.ml-2
+                  %span.search-error
+                    =search_error
+              -elif search
+                .mb-4.ml-1.text-base.leading-relaxed
+                  -blocktrans with results_count=paginator.count|intcomma count cc=paginator.count
+                    Found {{ results_count }} contact matching <i>{{search}}</i>.
+                    -plural
+                      Found {{ results_count }} contacts matching <i>{{search}}</i>.
+
+              .shadow.rounded-lg
+                -include "contacts/contact_list_include.haml"
+
+              .flex.flex-col(class="{%if not is_spa%}mb-16{%endif%}")
+                -include "includes/pagination.haml"
+
+                -if paginator.is_es_search and not page_obj.has_next_page and page_obj.number == paginator.num_pages and paginator.count > 10000
+                  .text-gray-400.text-sm.self-end.mt-2
+                    -trans "To view more than 10,000 search results, save it as a group."
+                
+          -else
+            -include "contacts/empty_include.haml"
+
 
 -block extra-script
   {{ block.super }}
 
-  :javascript
+  -block spa-script
+    :javascript
 
-    $(document).on('click', '.search-query', function() {
-      $(this).animate({ width: '600px'}, 200);
-    });
+      {% if org_perms.contacts.contact_delete %}
+      function onDeleteClicked(){
+        var deleteConfirmation = document.querySelector("#delete-confirmation");
+        deleteConfirmation.classList.remove("hide");
+        deleteConfirmation.open = true;
 
-    {% if org_perms.contacts.contact_create %}
-    if($(location).attr('hash') == '#contact') {
-      showCreateContactModal();
-    }
-    {% endif %}
-
-    {% if org_perms.contacts.contactgroup_create %}
-    if($(location).attr('hash') == '#group') {
-      showCreateGroupModal();
-    }
-    {% endif %}
-
-
-    // keeps track if we are on a link or not
-    var onLink = false;
-
-    {% if org_perms.contacts.contact_update %}
-
-    function addContactToGroup(groupId){
-      var contactIds = getCheckedIds();
-      var groupedIds = getLabeledIds(groupId);
-
-      var addGroup = true;
-
-      // find the intersection of contactIds and groupedIds
-      var contactIdsWithGroup = intersect(contactIds, groupedIds);
-
-      // they all belong to the group, so we are actually removing these contacts from the group
-      if (contactIdsWithGroup.length == contactIds.length){
-        addGroup = false;
+        deleteConfirmation.addEventListener("temba-button-clicked", function(event){
+          if (!event.detail.button.secondary) {
+            runActionOnObjectRows("delete");
+          }
+          deleteConfirmation.open = false;
+        });
       }
-      jQuery.ajaxSettings.traditional = true;
-      fetchPJAXContent("", "#pjax", { postData: {objects: contactIds, label: groupId, add: addGroup, action: 'label', pjax: 'true'}, forceReload: true });
-    }
 
-    {% endif %}
+      function handleDeleteAllContacts() {
+        var deleteAllConfirmation = document.querySelector('#delete-all-confirmation');
+        deleteAllConfirmation.classList.remove("hide");
+        deleteAllConfirmation.open = true;
 
-    {% if org_perms.contacts.contact_create %}
-    function showCreateContactModal() {
-      var modal = new Modax('{% trans "Create Contact" %}', '{% url "contacts.contact_create" %}')
-      modal.setIcon('icon-user')
-      modal.setListeners({
-        onSuccess: function() {
-          location.reload();
-        }
-      })
-      modal.show()
-    }
-    {% endif %}
-
-    {% if org_perms.contacts.contactgroup_create %}
-    function showCreateGroupModal() {
-      var modal = new Modax('{% trans "Create Contact Group" %}','{% url "contacts.contactgroup_create" %}')
-      modal.setIcon('icon-users')
-      modal.setListeners({
-        onSuccess: function() {
-          location.reload();
-        }
-      })
-      modal.show()
-    }
-    {% endif %}
-
-
-    {% if org_perms.msgs.broadcast_send %}
-    $(".send-button").click(function(){
-      var contactsUuids = getCheckedUuids();
-      if (contactsUuids.length > 0) {
-        showComposeInitialized("c=" + contactsUuids);
-      } else {
-        showCompose();
+        deleteAllConfirmation.addEventListener("temba-button-clicked", function(event){
+          if (event.detail.button.attributes.destructive){
+            jQuery.ajaxSettings.traditional = true;
+            fetchPJAXContent(document.location.href, '#pjax', {
+                postData: { action: "delete", all: 'true', pjax: 'true' },
+                forceReload: true
+            });
+          }
+          deleteAllConfirmation.classList.add("hide");
+          deleteAllConfirmation.open = false;
+        });
       }
-    });
-    {% endif %}
+      
+      {% endif %}
 
-    {% if org_perms.contacts.contact_create %}
-    $("#add-contact").live('click', function() { showCreateContactModal(); });
-    {% endif %}
+      function handleRowClicked(event) {
 
-    {% if org_perms.contacts.contact_delete %}
-    $(".contacts-btn-delete").live('click', function() {
-      modal = new ConfirmationModal($('.contact-deletion > .title').html(), $('.contact-deletion > .body').html());
-      modal.addClass('alert');
-      modal.setListeners({onPrimary: function(){
-        runActionOnObjectRows("delete");
-        modal.dismiss();
-      }}, false);
-      modal.setPrimaryButton('{% trans "Delete" %}');
-      modal.show();
-    });
-    {% endif %}
-
-    {% if org_perms.contacts.contact_unblock %}
-      $(".page-content").on('click', ".object-btn-unblock", function() {
-	    runActionOnObjectRows("unblock");
-      });
-      $(".page-content").on('click', ".object-btn-block", function() {
-	    runActionOnObjectRows("block");
-      });
-    {% endif %}
-
-    {% if org_perms.contacts.contact_unstop %}
-      $(".page-content").on('click', ".object-btn-unstop", function() {
-	    runActionOnObjectRows("unstop");
-      });
-    {% endif %}
-
-    {% if org_perms.contacts.contactgroup_create %}
-    $("#id_add_group").live('click', function() { showCreateGroupModal(); });
-    {% endif %}
-
-    $('.select-row').live('mouseover', function(){
-      url = '/contact/read/' + $(this).data('uuid');
-
-      $(this).find('td').not(':first-child').each(function(){
-        $(this).attr('onClick', "document.location.href=url;");
-      });
-    });
-
-    {% if org_perms.contacts.contactgroup_create %}
-
-    $('.page-content').on('click', ".add-group", function() {
-      var modal = new Modax('{% trans "Create Contact Group" %}', '{% url "contacts.contactgroup_create"%}');
-      modal.setIcon('icon-users');
-      modal.setListeners({
-        onFormLoaded: function() { $("#active-modal form input#id_preselected_contacts").val(getCheckedIds().join()); }
-      });
-      modal.setRedirectOnSuccess(true);
-      modal.show();
-    });
-
-    $('.page-content').on('click', ".add-dynamic-group", function() {
-    {% if save_dynamic_search %}
-      var modal = new Modax('{% trans "Save Search as Group" %}', '{% url "contacts.contactgroup_create"%}');
-      modal.setIcon('icon-users');
-      modal.setListeners({
-        onFormLoaded: function() { $("#active-modal form input#id_group_query").val('{{ search|escapejs }}'); }
-      });
-      modal.setRedirectOnSuccess(true);
-      modal.show();
-    {% else %}
-      var modal = new Modal('{% trans "Unable to create a dynamic group" %}','{% trans "You cannot create a dynamic group based on <strong>name</strong> or <strong>id</strong>." %}')
-      modal.setListeners({});
-      modal.show();
-    {% endif %}
-
-    });
-
-    {% endif %}
-
-    {% if org_perms.contacts.contactfield_managefields %}
-    $('.page-content').on('click', ".manage-fields", function() {
-      lastChecked = getCheckedIds();
-      var modal = new Modax('{% trans "Manage Contact Fields" %}', '{% url "contacts.contactfield_managefields" %}');
-      modal.setIcon('icon-vcard');
-      modal.setListeners({
-        onFormLoaded:function() {
-          useFontCheckbox("input[type=checkbox]", false);
-        },
-        onSuccess: function() {
-            // grab the current search string, sort_on/page/...
-            var url = window.location.search;
-
-            if (!url) {
-                url = '?'
-            }
-
-            // bust cache
-            url += '&ts=' + new Date().getTime();
-
-            fetchPJAXContent(url, '#pjax', {
-                forceReload: true,
-                onSuccess: function () {
-                    recheckIds();
-                }
-            })
+        if (event.target.tagName == "TEMBA-CHECKBOX") {
+          return;
         }
-      });
-      modal.show();
-    });
-    {% endif %}
 
-    {% if org_perms.contacts.contact_export %}
-    $(".export-contacts").live('click', function() {
-      var modal = new Modax('{% trans "Export Contacts" %}', '{{export_url}}');
-      modal.setListeners({
-        onSuccess: function() {
-          location.reload();
+        var row = event.target.closest("tr");
+        var uuid = row.getAttribute("data-uuid");
+
+        {% if is_spa %}
+        fetchURL("/contact/read/" + uuid + "/");
+        {% else %}
+        gotoLink("/contact/read/" + uuid + "/");
+        {% endif %}
+      }
+
+      function handleSendMessageClicked() {
+        // when we click send, include any clicked messages in our modax request
+        var sendEndpoint = "{% url 'msgs.broadcast_send' %}";
+        var sendButton = document.querySelector(".send-button");
+        var sendModal = document.querySelector("#send-message-modal");
+        var ids = getCheckedUuids();
+        if (ids.length > 0) {
+          sendModal.setAttribute("endpoint", sendEndpoint + '?c=' + ids);
+        } else {
+          sendModal.setAttribute("endpoint", sendEndpoint);
         }
-      })
-      modal.setPrimaryButton('{% trans "Start Export" %}');
-      modal.show();
-    });
-    {% endif %}
+      }
+
+      // keeps track if we are on a link or not
+      var onLink = false;
+
+      {% if org_perms.contacts.contact_update %}
+      function addContactToGroup(groupId){
+        var contactIds = getCheckedIds();
+        var groupedIds = getLabeledIds(groupId);
+
+        var addGroup = true;
+
+        // find the intersection of contactIds and groupedIds
+        var contactIdsWithGroup = intersect(contactIds, groupedIds);
+
+        // they all belong to the group, so we are actually removing these contacts from the group
+        if (contactIdsWithGroup.length == contactIds.length){
+          addGroup = false;
+        }
+        jQuery.ajaxSettings.traditional = true;
+
+        fetchPJAXContent(document.location.href, "#pjax", { postData: {objects: contactIds, label: groupId, add: addGroup, action: 'label', pjax: 'true'}, forceReload: true, onSuccess: wireTableListeners});
+      }
+      {% endif %}
+
+      {% if org_perms.contacts.contact_block %}
+        $(".lp-frame").on('click', ".object-btn-unblock", function() {
+          runActionOnObjectRows("unblock");
+        });
+        $(".lp-frame").on('click', ".object-btn-block", function() {
+          runActionOnObjectRows("block");
+        });
+      {% endif %}
+
+      {% if org_perms.contacts.contact_unstop %}
+        $(".lp-frame").on('click', ".object-btn-unstop", function() {
+          runActionOnObjectRows("unstop");
+        });
+      {% endif %}
+
+      function handleCreateGroupModalLoaded(event) {
+        lastChecked = getCheckedIds();
+        var body = event.detail.body;
+        body.querySelector("#id_preselected_contacts").value = lastChecked.join();
+      }
+
+      function handleCreateGroupModalSubmitted(event) {
+        refresh(function() { recheckIds(); }, true);
+      }
+
+      function handleAddGroupClicked() {
+        document.getElementById("create-group-modal").open = true;
+      }
+

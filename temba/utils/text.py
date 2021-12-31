@@ -1,10 +1,13 @@
 import base64
+import io
 import random
 import re
 import string
 import sys
 from collections import Counter
+from os import urandom
 
+import chardet
 import regex
 
 from django.utils.encoding import force_text
@@ -137,9 +140,35 @@ def slugify_with(value, sep="_"):
     return slugify(value).replace("-", sep)
 
 
+def unsnakify(value):
+    """
+    Un-snakifies the given text
+    """
+    return " ".join([word.capitalize() for word in value.split("_")])
+
+
 def random_string(length):
     """
     Generates a random alphanumeric string
     """
     letters = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # avoid things that could be mistaken ex: 'I' and '1'
     return "".join([random.choice(letters) for _ in range(length)])
+
+
+def generate_token():
+    return base64.b32encode(urandom(5)).decode("utf-8").lower()
+
+
+def decode_stream(f):
+    """
+    Detects the character encoding of the given byte stream and returns as text stream
+    """
+
+    data = f.read()
+    f.seek(0)
+
+    encoding = chardet.detect(data)["encoding"]
+    if encoding == "ascii":
+        encoding = "utf-8"
+
+    return io.TextIOWrapper(f, encoding=encoding)

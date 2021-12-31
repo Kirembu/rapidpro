@@ -3,20 +3,24 @@ from django.utils.translation import ugettext_lazy as _
 
 from temba.channels.models import Channel
 from temba.channels.views import ALL_COUNTRIES, AuthenticatedExternalClaimView, ClaimViewMixin
+from temba.utils.fields import ExternalURLField, SelectWidget
 
 
 class ClaimView(AuthenticatedExternalClaimView):
     class Form(ClaimViewMixin.Form):
         country = forms.ChoiceField(
-            choices=ALL_COUNTRIES, label=_("Country"), help_text=_("The country this phone number is used in")
+            choices=ALL_COUNTRIES,
+            widget=SelectWidget(attrs={"searchable": True}),
+            label=_("Country"),
+            help_text=_("The country this phone number is used in"),
         )
         number = forms.CharField(
             max_length=14,
             min_length=4,
             label=_("Number"),
-            help_text=("The shortcode or phone number you are connecting."),
+            help_text=("The short code or phone number you are connecting."),
         )
-        url = forms.URLField(
+        url = ExternalURLField(
             label=_("URL"),
             help_text=_(
                 "The URL for the Junebug channel. ex: https://junebug.praekelt.org/jb/channels/3853bb51-d38a-4bca-b332-8a57c00f2a48/messages.json"
@@ -48,7 +52,7 @@ class ClaimView(AuthenticatedExternalClaimView):
             data["number"],
             data["username"],
             data["password"],
-            "JN",
+            self.channel_type,
             data.get("url"),
             role=Channel.DEFAULT_ROLE,
             extra_config=config,

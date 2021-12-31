@@ -3,8 +3,7 @@ import copy
 import hashlib
 import hmac
 import time
-import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 from urllib.parse import quote
 
@@ -12,9 +11,8 @@ from django_redis import get_redis_connection
 from smartmin.tests import SmartminTest
 
 from django.conf import settings
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from django.core import mail
-from django.core.cache import cache
 from django.template import loader
 from django.test import RequestFactory
 from django.test.utils import override_settings
@@ -23,43 +21,24 @@ from django.utils import timezone
 from django.utils.encoding import force_bytes, force_text
 
 from temba.channels.views import channel_status_processor
-from temba.contacts.models import TEL_SCHEME, TWITTER_SCHEME, URN, Contact, ContactGroup, ContactURN
-from temba.flows.models import FlowRun
+from temba.contacts.models import URN, Contact, ContactGroup, ContactURN
 from temba.ivr.models import IVRCall
-from temba.msgs.models import (
-    DELIVERED,
-    ERRORED,
-    FAILED,
-    HANDLE_EVENT_TASK,
-    INCOMING,
-    IVR,
-    PENDING,
-    QUEUED,
-    SENT,
-    WIRED,
-    Broadcast,
-    Msg,
-)
-from temba.orgs.models import (
-    ACCOUNT_SID,
-    ACCOUNT_TOKEN,
-    APPLICATION_SID,
-    FREE_PLAN,
-    NEXMO_APP_ID,
-    NEXMO_APP_PRIVATE_KEY,
-    NEXMO_KEY,
-    NEXMO_SECRET,
-    NEXMO_UUID,
-    Org,
-)
-from temba.tests import MockResponse, TembaTest
+from temba.msgs.models import Msg
+from temba.orgs.models import Org
+from temba.tests import AnonymousOrg, CRUDLTestMixin, MockResponse, TembaTest, matchers, mock_mailroom
 from temba.triggers.models import Trigger
-from temba.utils import dict_to_struct, get_anonymous_user, json
-from temba.utils.dates import datetime_to_ms, ms_to_datetime
-from temba.utils.queues import Queue, push_task
+from temba.utils import dict_to_struct, json
+from temba.utils.models import generate_uuid
 
-from .models import CHANNEL_EVENT, Alert, Channel, ChannelConnection, ChannelCount, ChannelEvent, ChannelLog, SyncEvent
-from .tasks import check_channels_task, squash_channelcounts, sync_old_seen_channels_task
+from .models import Alert, Channel, ChannelCount, ChannelEvent, ChannelLog, SyncEvent
+from .tasks import (
+    check_channels_task,
+    squash_channelcounts,
+    sync_old_seen_channels_task,
+    track_org_channel_counts,
+    trim_channel_log_task,
+    trim_sync_events_task,
+)
 
 
 class ChannelTest(TembaTest):
@@ -68,54 +47,52 @@ class ChannelTest(TembaTest):
 
         self.channel.delete()
 
-        self.tel_channel = Channel.create(
-            self.org,
-            self.user,
-            "RW",
-            "A",
-            name="Test Channel",
-            address="+250785551212",
-            role="SR",
-            secret="12345",
-            config={Channel.CONFIG_FCM_ID: "123"},
+        self.tel_channel = self.create_channel(
+            "A", "Test Channel", "+250785551212", country="RW", secret="12345", config={"FCM_ID": "123"}
         )
+        self.twitter_channel = self.create_channel("TWT", "Twitter Channel", "billy_bob")
 
-        self.twitter_channel = Channel.create(
-            self.org, self.user, None, "TWT", name="Twitter Channel", address="billy_bob", role="SR"
-        )
+        self.unclaimed_channel = self.create_channel("NX", "Unclaimed Channel", "", config={"FCM_ID": "000"})
+        self.unclaimed_channel.org = None
+        self.unclaimed_channel.save(update_fields=("org",))
 
-        self.unclaimed_channel = Channel.create(
-            None,
-            self.user,
-            None,
-            "NX",
-            name="Unclaimed Channel",
-            address=None,
-            secret=None,
-            config={Channel.CONFIG_FCM_ID: "000"},
-        )
+    def claim_new_android(self, fcm_id: str = "FCM111", number: str = "0788123123") -> Channel:
+        """
+        Helper function to register and claim a new Android channel
+        """
+        cmds = [dict(cmd="fcm", fcm_id=fcm_id, uuid="uuid"), dict(cmd="status", cc="RW", dev="Nexus")]
+        response = self.client.post(reverse("register"), json.dumps({"cmds": cmds}), content_type="application/json")
+        self.assertEqual(200, response.status_code)
 
-        self.ussd_channel = Channel.create(
-            self.org, self.user, None, "JNU", name="Junebug USSD", address="*123#", role=Channel.ROLE_USSD
+        android = Channel.objects.order_by("id").last()
+
+        self.login(self.admin)
+        response = self.client.post(
+            reverse("channels.types.android.claim"), {"claim_code": android.claim_code, "phone_number": number}
         )
+        self.assertRedirect(response, "/welcome/")
+
+        android.refresh_from_db()
+        return android
 
     def send_message(self, numbers, message, org=None, user=None):
-        if not org:
-            org = self.org
-
-        if not user:
-            user = self.user
+        org = org or self.org
+        user = user or self.user
 
         group = ContactGroup.get_or_create(org, user, "Numbers: %s" % ",".join(numbers))
-        contacts = list()
+
+        contacts = []
         for number in numbers:
-            contact, urn_obj = Contact.get_or_create(org, URN.from_tel(number), user=user, name=None)
-            contacts.append(contact)
+            urn = URN.from_tel(number)
+            urn_obj = ContactURN.lookup(org, urn)
+            if urn_obj:
+                contacts.append(urn_obj.contact)
+            else:
+                contacts.append(self.create_contact("", urns=[urn]))
 
         group.contacts.add(*contacts)
 
-        broadcast = Broadcast.create(org, user, message, groups=[group])
-        broadcast.send()
+        broadcast = self.create_broadcast(user, message, groups=[group], msg_status="W")
 
         msg = Msg.objects.filter(broadcast=broadcast).order_by("text", "pk")
         if len(numbers) == 1:
@@ -133,27 +110,20 @@ class ChannelTest(TembaTest):
 
         raise Exception("Did not find '%s' cmd in response: '%s'" % (cmd_name, response.content))
 
-    def test_expressions_context(self):
-        context = self.tel_channel.build_expressions_context()
-        self.assertEqual(context["__default__"], "+250 785 551 212")
-        self.assertEqual(context["name"], "Test Channel")
-        self.assertEqual(context["address"], "+250 785 551 212")
-        self.assertEqual(context["tel"], "+250 785 551 212")
-        self.assertEqual(context["tel_e164"], "+250785551212")
+    def test_channel_read_with_customer_support(self):
+        self.customer_support.is_staff = True
+        self.customer_support.save()
 
-        context = self.twitter_channel.build_expressions_context()
-        self.assertEqual(context["__default__"], "@billy_bob")
-        self.assertEqual(context["name"], "Twitter Channel")
-        self.assertEqual(context["address"], "@billy_bob")
-        self.assertEqual(context["tel"], "")
-        self.assertEqual(context["tel_e164"], "")
+        self.login(self.customer_support)
 
-        context = self.unclaimed_channel.build_expressions_context()
-        self.assertEqual(context["__default__"], "Unclaimed Channel")
-        self.assertEqual(context["name"], "Unclaimed Channel")
-        self.assertEqual(context["address"], "")
-        self.assertEqual(context["tel"], "")
-        self.assertEqual(context["tel_e164"], "")
+        response = self.client.get(reverse("channels.channel_read", args=[self.tel_channel.uuid]))
+
+        gear_links = response.context["view"].get_gear_links()
+        self.assertListEqual([gl["title"] for gl in gear_links], ["Service"])
+        self.assertEqual(
+            gear_links[-1]["href"],
+            f"/org/service/?organization={self.tel_channel.org_id}&redirect_url=/channels/channel/read/{self.tel_channel.uuid}/",
+        )
 
     def test_deactivate(self):
         self.login(self.admin)
@@ -166,14 +136,22 @@ class ChannelTest(TembaTest):
         self.login(self.admin)
 
         channel_types = (
-            ("JN", Channel.DEFAULT_ROLE, "Channel Log"),
-            ("JNU", Channel.ROLE_USSD, "USSD Log"),
-            ("T", Channel.ROLE_CALL, "Call Log"),
-            ("T", Channel.ROLE_SEND + Channel.ROLE_CALL, "Channel Log"),
+            ("JN", Channel.DEFAULT_ROLE, None, "Channel Log"),
+            ("T", Channel.ROLE_CALL, None, "Call Log"),
+            ("T", Channel.ROLE_SEND + Channel.ROLE_CALL, None, "Channel Log"),
+            ("EX", Channel.ROLE_RECEIVE, ["tel"], "Channel Log"),
         )
 
-        for channel_type, channel_role, link_text in channel_types:
-            channel = Channel.create(self.org, self.user, None, channel_type, name="Test Channel", role=channel_role)
+        for channel_type, channel_role, channel_schemes, link_text in channel_types:
+            channel = Channel.create(
+                self.org,
+                self.user,
+                None,
+                channel_type,
+                name="Test Channel",
+                role=channel_role,
+                schemes=channel_schemes,
+            )
             response = self.client.get(reverse("channels.channel_read", args=[channel.uuid]))
             self.assertContains(response, link_text)
 
@@ -185,35 +163,44 @@ class ChannelTest(TembaTest):
         self.assertFalse(self.org.supports_ivr())
 
         # pretend we are connected to twiliko
-        self.org.config = dict(ACCOUNT_SID="AccountSid", ACCOUNT_TOKEN="AccountToken", APPLICATION_SID="AppSid")
-        self.org.save()
+        self.org.config = {"ACCOUNT_SID": "AccountSid", "ACCOUNT_TOKEN": "AccountToken"}
+        self.org.save(update_fields=("config",))
 
         # add a delegate caller
         post_data = dict(channel=self.tel_channel.pk, connection="T")
         response = self.client.post(reverse("channels.channel_create_caller"), post_data)
 
+        # get the caller, make sure config options are set
+        caller = Channel.objects.get(org=self.org, role="C")
+        self.assertEqual("AccountSid", caller.config["account_sid"])
+        self.assertEqual("AccountToken", caller.config["auth_token"])
+
         # now we should be IVR capable
         self.assertTrue(self.org.supports_ivr())
+
+        # we cannot add multiple callers
+        response = self.client.post(reverse("channels.channel_create_caller"), post_data)
+        self.assertFormError(response, "form", "channel", "A caller has already been added for that number")
 
         # should now have the option to disable
         self.login(self.admin)
         response = self.client.get(reverse("channels.channel_read", args=[self.tel_channel.uuid]))
-        self.assertContains(response, "Disable Voice Calls")
+        self.assertContains(response, "Disable Voice Calling")
 
         # try adding a caller for an invalid channel
         response = self.client.post("%s?channel=20000" % reverse("channels.channel_create_caller"))
         self.assertEqual(200, response.status_code)
-        self.assertEqual(
-            "Sorry, a caller cannot be added for that number", response.context["form"].errors["channel"][0]
-        )
+        self.assertFormError(response, "form", "channel", "A caller cannot be added for that number")
 
         # disable our twilio connection
-        self.org.remove_twilio_account(self.admin)
+        with patch("temba.channels.types.twilio.TwilioType.deactivate"):
+            self.org.remove_twilio_account(self.admin)
+
         self.assertFalse(self.org.supports_ivr())
 
         # we should lose our caller
         response = self.client.get(reverse("channels.channel_read", args=[self.tel_channel.uuid]))
-        self.assertNotContains(response, "Disable Voice Calls")
+        self.assertNotContains(response, "Disable Voice Calling")
 
         # now try and add it back without a twilio connection
         response = self.client.post(reverse("channels.channel_create_caller"), post_data)
@@ -228,114 +215,26 @@ class ChannelTest(TembaTest):
     def test_get_channel_type_name(self):
         self.assertEqual(self.tel_channel.get_channel_type_name(), "Android Phone")
         self.assertEqual(self.twitter_channel.get_channel_type_name(), "Twitter Channel")
-        self.assertEqual(self.unclaimed_channel.get_channel_type_name(), "Nexmo Channel")
+        self.assertEqual(self.unclaimed_channel.get_channel_type_name(), "Vonage Channel")
 
-    def test_channel_selection(self):
-        # make our default tel channel MTN
-        mtn = self.tel_channel
-        mtn.name = "MTN"
-        mtn.save()
+    def test_get_address_display(self):
+        self.assertEqual("+250 785 551 212", self.tel_channel.get_address_display())
+        self.assertEqual("+250785551212", self.tel_channel.get_address_display(e164=True))
 
-        # create a channel for Tigo too
-        tigo = Channel.create(
-            self.org,
-            self.user,
-            "RW",
-            "A",
-            "Tigo",
-            "+250725551212",
-            secret="11111",
-            config={Channel.CONFIG_FCM_ID: "456"},
-        )
+        self.assertEqual("@billy_bob", self.twitter_channel.get_address_display())
 
-        # new contact on MTN should send with the MTN channel
-        msg = self.send_message(["+250788382382"], "Sent to an MTN number")
-        self.assertEqual(mtn, self.org.get_send_channel(contact_urn=msg.contact_urn))
-        self.assertEqual(mtn, msg.channel)
-
-        # new contact on Tigo should send with the Tigo channel
-        msg = self.send_message(["+250728382382"], "Sent to a Tigo number")
-        self.assertEqual(tigo, self.org.get_send_channel(contact_urn=msg.contact_urn))
-        self.assertEqual(tigo, msg.channel)
-
-        # now our MTN contact texts, the tigo number which should change their affinity
-        msg = Msg.create_incoming(tigo, "tel:+250788382382", "Send an inbound message to Tigo")
-        self.assertEqual(tigo, msg.channel)
-        self.assertEqual(tigo, self.org.get_send_channel(contact_urn=msg.contact_urn))
-        self.assertEqual(tigo, ContactURN.objects.get(path="+250788382382").channel)
-
-        # new contact on Airtel (some overlap) should send with the Tigo channel since it is newest
-        msg = self.send_message(["+250738382382"], "Sent to a Airtel number")
-        self.assertEqual(tigo, self.org.get_send_channel(contact_urn=msg.contact_urn))
-        self.assertEqual(tigo, msg.channel)
-
-        # add a voice caller
-        caller = Channel.add_call_channel(self.org, self.user, self.tel_channel)
-
-        # set our affinity to the caller (ie, they were on an ivr call)
-        ContactURN.objects.filter(path="+250788382382").update(channel=caller)
-        self.assertEqual(mtn, self.org.get_send_channel(contact_urn=ContactURN.objects.get(path="+250788382382")))
-
-        # change channel numbers to be shortcodes, i.e. no overlap with contact numbers
-        mtn.address = "1234"
-        mtn.save()
-        tigo.address = "1235"
-        tigo.save()
-
-        self.org.clear_cached_channels()
-
-        # should return the newest channel which is TIGO
-        msg = self.send_message(["+250788382382"], "Sent to an MTN number, but with shortcode channels")
-        self.assertEqual(tigo, msg.channel)
-        self.assertEqual(tigo, self.org.get_send_channel(contact_urn=msg.contact_urn))
-
-        # if we have prefixes matching set should honor those
-        mtn.config = {Channel.CONFIG_SHORTCODE_MATCHING_PREFIXES: ["25078", "25072"]}
-        mtn.save()
-
-        self.org.clear_cached_channels()
-
-        msg = self.send_message(["+250788382382"], "Sent to an MTN number with shortcode channels and prefixes set")
-        self.assertEqual(mtn, msg.channel)
-        self.assertEqual(mtn, self.org.get_send_channel(contact_urn=msg.contact_urn))
-
-        msg = self.send_message(["+250728382382"], "Sent to a TIGO number with shortcode channels and prefixes set")
-        self.assertEqual(mtn, msg.channel)
-        self.assertEqual(mtn, self.org.get_send_channel(contact_urn=msg.contact_urn))
-
-        # check for twitter
-        self.assertEqual(self.twitter_channel, self.org.get_send_channel(scheme=TWITTER_SCHEME))
-
-        contact = self.create_contact("Billy", number="+250722222222", twitter="billy_bob")
-        twitter_urn = contact.get_urn(schemes=[TWITTER_SCHEME])
-        self.assertEqual(self.twitter_channel, self.org.get_send_channel(contact_urn=twitter_urn))
-
-    def test_message_splitting(self):
-        # external API requires messages to be <= 160 chars
-        self.tel_channel.channel_type = "EX"
-        self.tel_channel.save()
-
-        msg = Msg.create_outgoing(self.org, self.user, "tel:+250738382382", "x" * 400)  # 400 chars long
-        Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
-        self.assertEqual(3, Msg.objects.get(pk=msg.id).msg_count)
-
-        # Nexmo limit is 1600
-        self.tel_channel.channel_type = "NX"
-        self.tel_channel.save()
-        cache.clear()  # clear the channel from cache
-
-        msg = Msg.create_outgoing(self.org, self.user, "tel:+250738382382", "y" * 400)
-        Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
-        self.assertEqual(self.tel_channel, Msg.objects.get(pk=msg.id).channel)
-        self.assertEqual(1, Msg.objects.get(pk=msg.id).msg_count)
+        # make sure it works with alphanumeric numbers
+        self.tel_channel.address = "EATRIGHT"
+        self.assertEqual("EATRIGHT", self.tel_channel.get_address_display())
+        self.assertEqual("EATRIGHT", self.tel_channel.get_address_display(e164=True))
 
     def test_ensure_normalization(self):
         self.tel_channel.country = "RW"
         self.tel_channel.save()
 
-        contact1 = self.create_contact("contact1", "0788111222")
-        contact2 = self.create_contact("contact2", "+250788333444")
-        contact3 = self.create_contact("contact3", "+18006927753")
+        contact1 = self.create_contact("contact1", phone="0788111222")
+        contact2 = self.create_contact("contact2", phone="+250788333444")
+        contact3 = self.create_contact("contact3", phone="+18006927753")
 
         self.org.normalize_contact_tels()
 
@@ -343,9 +242,9 @@ class ChannelTest(TembaTest):
         norm_c2 = Contact.objects.get(pk=contact2.pk)
         norm_c3 = Contact.objects.get(pk=contact3.pk)
 
-        self.assertEqual(norm_c1.get_urn(TEL_SCHEME).path, "+250788111222")
-        self.assertEqual(norm_c2.get_urn(TEL_SCHEME).path, "+250788333444")
-        self.assertEqual(norm_c3.get_urn(TEL_SCHEME).path, "+18006927753")
+        self.assertEqual(norm_c1.get_urn(URN.TEL_SCHEME).path, "+250788111222")
+        self.assertEqual(norm_c2.get_urn(URN.TEL_SCHEME).path, "+250788333444")
+        self.assertEqual(norm_c3.get_urn(URN.TEL_SCHEME).path, "+18006927753")
 
     def test_channel_create(self):
 
@@ -389,116 +288,111 @@ class ChannelTest(TembaTest):
                 schemes=["fb"],
             )
 
-    def test_delete(self):
-        self.org.administrators.add(self.user)
-        self.user.set_org(self.org)
-        self.login(self.user)
-
-        # a message, a call, and a broadcast
-        msg = self.send_message(["250788382382"], "How is it going?")
-        call = ChannelEvent.create(
-            self.tel_channel, "tel:+250788383385", ChannelEvent.TYPE_CALL_IN, timezone.now(), {}
+    @mock_mailroom
+    def test_release(self, mr_mocks):
+        # create two channels..
+        channel1 = Channel.create(
+            self.org, self.user, "RW", "A", "Test Channel", "0785551212", config={Channel.CONFIG_FCM_ID: "123"}
         )
-
-        self.assertEqual(self.org, msg.org)
-        self.assertEqual(self.tel_channel, msg.channel)
-        self.assertEqual(1, Msg.get_messages(self.org).count())
-        self.assertEqual(1, ChannelEvent.get_all(self.org).count())
-        self.assertEqual(1, Broadcast.objects.filter(org=self.org).count())
-
-        # start off in the pending state
-        self.assertEqual("P", msg.status)
-
-        response = self.fetch_protected(reverse("channels.channel_delete", args=[self.tel_channel.pk]), self.user)
-        self.assertContains(response, "Test Channel")
-
-        response = self.fetch_protected(
-            reverse("channels.channel_delete", args=[self.tel_channel.pk]), post_data=dict(remove=True), user=self.user
-        )
-        self.assertRedirect(response, reverse("orgs.org_home"))
-
-        msg = Msg.objects.get(pk=msg.pk)
-        self.assertIsNotNone(msg.channel)
-        self.assertFalse(msg.channel.is_active)
-        self.assertEqual(self.org, msg.org)
-
-        # queued messages for the channel should get marked as failed
-        self.assertEqual("F", msg.status)
-
-        call = ChannelEvent.objects.get(pk=call.pk)
-        self.assertIsNotNone(call.channel)
-        self.assertFalse(call.channel.is_active)
-
-        self.assertEqual(self.org, call.org)
-
-        broadcast = Broadcast.objects.get(pk=msg.broadcast.pk)
-        self.assertEqual(self.org, broadcast.org)
-
-        # should still be considered that user's message, call and broadcast
-        self.assertEqual(1, Msg.get_messages(self.org).count())
-        self.assertEqual(1, ChannelEvent.get_all(self.org).count())
-        self.assertEqual(1, Broadcast.objects.filter(org=self.org).count())
-
-        # syncing this channel should result in a release
-        post_data = dict(
-            cmds=[dict(cmd="status", p_sts="CHA", p_src="BAT", p_lvl="60", net="UMTS", pending=[], retry=[])]
-        )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
-
-        # our response should contain a release
-        self.assertHasCommand("rel", response)
-
-        # create a channel
-        channel = Channel.create(
-            self.org,
-            self.user,
-            "RW",
-            "A",
-            "Test Channel",
-            "0785551212",
-            secret=Channel.generate_secret(),
-            config={Channel.CONFIG_FCM_ID: "123"},
-        )
-
-        response = self.fetch_protected(reverse("channels.channel_delete", args=[channel.pk]), self.superuser)
-        self.assertContains(response, "Test Channel")
-
-        response = self.fetch_protected(
-            reverse("channels.channel_delete", args=[channel.pk]), post_data=dict(remove=True), user=self.superuser
-        )
-        self.assertRedirect(response, reverse("orgs.org_home"))
-
-        # create a channel
-        channel = Channel.create(
-            self.org,
-            self.user,
-            "RW",
-            "A",
-            "Test Channel",
-            "0785551212",
-            secret=Channel.generate_secret(),
-            config={Channel.CONFIG_FCM_ID: "123"},
-        )
+        channel2 = Channel.create(self.org, self.user, "", "T", "Test Channel", "0785553333")
 
         # add channel trigger
-        from temba.triggers.models import Trigger
-
+        flow = self.get_flow("color")
         Trigger.objects.create(
-            org=self.org, flow=self.create_flow(), channel=channel, modified_by=self.admin, created_by=self.admin
+            org=self.org, flow=flow, channel=channel1, modified_by=self.admin, created_by=self.admin
         )
 
-        self.assertTrue(Trigger.objects.filter(channel=channel, is_active=True))
-
-        response = self.fetch_protected(
-            reverse("channels.channel_delete", args=[channel.pk]), post_data=dict(remove=True), user=self.superuser
+        # create some activity on this channel
+        contact = self.create_contact("Bob", phone="+593979123456")
+        self.create_incoming_msg(contact, "Hi", channel=channel1)
+        self.create_outgoing_msg(contact, "Hi", channel=channel1, status="P")
+        self.create_outgoing_msg(contact, "Hi", channel=channel1, status="E")
+        self.create_outgoing_msg(contact, "Hi", channel=channel1, status="S")
+        Alert.objects.create(
+            channel=channel1, alert_type=Alert.TYPE_POWER, created_by=self.admin, modified_by=self.admin
+        )
+        Alert.objects.create(
+            channel=channel1, alert_type=Alert.TYPE_DISCONNECTED, created_by=self.admin, modified_by=self.admin
+        )
+        SyncEvent.create(
+            channel1,
+            dict(p_src="AC", p_sts="DIS", p_lvl=80, net="WIFI", pending=[1, 2], retry=[3, 4], cc="RW"),
+            [1, 2],
         )
 
-        self.assertRedirect(response, reverse("orgs.org_home"))
+        # and some on another channel
+        self.create_outgoing_msg(contact, "Hi", channel=channel2, status="E")
+        Alert.objects.create(
+            channel=channel2, alert_type=Alert.TYPE_POWER, created_by=self.admin, modified_by=self.admin
+        )
+        SyncEvent.create(
+            channel2,
+            dict(p_src="AC", p_sts="DIS", p_lvl=80, net="WIFI", pending=[1, 2], retry=[3, 4], cc="RW"),
+            [1, 2],
+        )
+        Trigger.objects.create(
+            org=self.org, flow=flow, channel=channel2, modified_by=self.admin, created_by=self.admin
+        )
 
-        # channel trigger should have be removed
-        self.assertFalse(Trigger.objects.filter(channel=channel, is_active=True))
+        # add channel to a flow as a dependency
+        flow.channel_dependencies.add(channel1)
+
+        channel1.release(self.admin)
+
+        flow.refresh_from_db()
+        self.assertTrue(flow.has_issues)
+        self.assertNotIn(channel1, flow.channel_dependencies.all())
+
+        # should have failed the pending and errored messages
+        self.assertEqual(2, self.org.msgs.filter(status="F").count())
+
+        self.assertEqual(0, channel1.alerts.count())
+        self.assertEqual(0, channel1.sync_events.count())
+        self.assertEqual(0, channel1.triggers.filter(is_active=True).count())
+
+        # check that we queued a task to interrupt sessions tied to this channel
+        self.assertEqual(
+            {
+                "org_id": self.org.id,
+                "type": "interrupt_sessions",
+                "queued_on": matchers.Datetime(),
+                "task": {"channel_ids": [channel1.id]},
+            },
+            mr_mocks.queued_batch_tasks[-1],
+        )
+
+        # other channel should be unaffected
+        self.assertEqual(1, channel2.msgs.filter(status="E").count())
+        self.assertEqual(1, channel2.alerts.count())
+        self.assertEqual(1, channel2.sync_events.count())
+        self.assertEqual(1, channel2.triggers.filter(is_active=True).count())
+
+    @mock_mailroom
+    def test_release_android(self, mr_mocks):
+        android = self.claim_new_android()
+        self.assertEqual("FCM111", android.config.get(Channel.CONFIG_FCM_ID))
+
+        # add bulk sender
+        self.org.connect_vonage("key", "secret", self.admin)
+        vonage = Channel.add_vonage_bulk_sender(self.admin, android)
+
+        # release it
+        android.release(self.admin)
+
+        android.refresh_from_db()
+        vonage.refresh_from_db()
+
+        response = self.sync(android, cmds=[])
+        self.assertEqual(200, response.status_code)
+
+        # should be a rel cmd to instruct app to reset
+        self.assertEqual({"cmds": [{"cmd": "rel", "relayer_id": str(android.id)}]}, response.json())
+
+        # and FCM ID now cleared
+        self.assertIsNone(android.config.get(Channel.CONFIG_FCM_ID))
+
+        # bulk sender was also released
+        self.assertFalse(vonage.is_active)
 
     def test_list(self):
         # de-activate existing channels
@@ -576,7 +470,7 @@ class ChannelTest(TembaTest):
             self.org,
             self.user,
             None,
-            Channel.TYPE_ANDROID,
+            "A",
             None,
             "+250781112222",
             config={Channel.CONFIG_FCM_ID: "asdf"},
@@ -589,13 +483,13 @@ class ChannelTest(TembaTest):
         self.assertNotIn("unsent_msgs", response.context, msg="Found unsent_msgs in context")
 
         # simulate a sync in back in two hours
-        post_data = dict(
+        self.sync(
+            channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="CHA", p_src="BAT", p_lvl="60", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-        self.sync(channel, post_data)
         sync_event = SyncEvent.objects.all()[0]
         sync_event.created_on = timezone.now() - timedelta(hours=2)
         sync_event.save()
@@ -604,8 +498,10 @@ class ChannelTest(TembaTest):
         self.assertIn("delayed_syncevents", response.context)
         self.assertNotIn("unsent_msgs", response.context, msg="Found unsent_msgs in context")
 
+        contact = self.create_contact("Bob", phone="+250788123123")
+
         # add a message, just sent so shouldn't have delayed
-        msg = Msg.create_outgoing(self.org, self.user, "tel:250788123123", "test")
+        msg = self.create_outgoing_msg(contact, "test", channel=channel)
         response = self.client.get("/", Follow=True)
         self.assertIn("delayed_syncevents", response.context)
         self.assertNotIn("unsent_msgs", response.context, msg="Found unsent_msgs in context")
@@ -613,7 +509,7 @@ class ChannelTest(TembaTest):
         # but put it in the past
         msg.delete()
         with patch("django.utils.timezone.now", return_value=timezone.now() - timedelta(hours=3)):
-            Msg.create_outgoing(self.org, self.user, "tel:250788123123", "test")
+            self.create_outgoing_msg(contact, "test", channel=channel, status=Msg.STATUS_QUEUED)
 
         response = self.client.get("/", Follow=True)
         self.assertIn("delayed_syncevents", response.context)
@@ -621,7 +517,7 @@ class ChannelTest(TembaTest):
 
         # if there is a successfully sent message after sms was created we do not consider it as delayed
         with patch("django.utils.timezone.now", return_value=timezone.now() - timedelta(hours=2)):
-            success_msg = Msg.create_outgoing(self.org, self.user, "tel:+250788123123", "success-send")
+            success_msg = self.create_outgoing_msg(contact, "success-send", channel=channel)
 
         success_msg.sent_on = timezone.now() - timedelta(hours=2)
         success_msg.status = "S"
@@ -632,7 +528,6 @@ class ChannelTest(TembaTest):
 
         # test that editors have the channel of the the org the are using
         other_user = self.create_user("Other")
-        self.create_secondary_org()
         self.org2.administrators.add(other_user)
         self.org.editors.add(other_user)
         self.assertFalse(self.org2.channels.all())
@@ -653,15 +548,15 @@ class ChannelTest(TembaTest):
         response = self.client.get("/", follow=True)
         # self.assertIn('channel_type', response.context)
 
-    def sync(self, channel, post_data=None, signature=None):
-        if not post_data:
-            post_data = "{}"
-        else:
-            post_data = json.dumps(post_data)
+    def sync(self, channel, *, cmds, signature=None, auto_add_fcm=True):
+        # prepend FCM command if not included
+        if auto_add_fcm and (not cmds or cmds[0]["cmd"] != "fcm"):
+            cmds = [{"cmd": "fcm", "fcm_id": "3256262", "uuid": str(channel.uuid), "p_id": 1}] + cmds
 
+        post_data = json.dumps({"cmds": cmds})
         ts = int(time.time())
-        if not signature:
 
+        if not signature:
             # sign the request
             key = str(channel.secret) + str(ts)
             signature = hmac.new(key=force_bytes(key), msg=force_bytes(post_data), digestmod=hashlib.sha256).digest()
@@ -670,142 +565,29 @@ class ChannelTest(TembaTest):
             signature = quote(base64.urlsafe_b64encode(signature))
 
         return self.client.post(
-            "%s?signature=%s&ts=%d" % (reverse("sync", args=[channel.pk]), signature, ts),
+            "%s?signature=%s&ts=%d" % (reverse("sync", args=[channel.id]), signature, ts),
             content_type="application/json",
             data=post_data,
         )
 
-    def test_update(self):
-        update_url = reverse("channels.channel_update", args=[self.tel_channel.id])
-
-        # only user of the org can view the update page of a channel
-        self.client.logout()
-        self.login(self.user)
-        response = self.client.get(update_url)
-        self.assertEqual(302, response.status_code)
-
-        self.login(self.user)
-        # visit the channel's update page as a manager within the channel's organization
-        self.org.administrators.add(self.user)
-        response = self.fetch_protected(update_url, self.user)
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(response.request["PATH_INFO"], update_url)
-
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Test Channel")
-        self.assertEqual(channel.address, "+250785551212")
-
-        postdata = dict()
-        postdata["name"] = "Test Channel Update1"
-        postdata["address"] = "+250785551313"
-
-        self.login(self.user)
-        response = self.client.post(update_url, postdata, follow=True)
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Test Channel Update1")
-        self.assertEqual(channel.address, "+250785551313")
-
-        # if we change the channel to a twilio type, shouldn't be able to edit our address
-        channel.channel_type = "T"
-        channel.save()
-
-        response = self.client.get(update_url)
-        self.assertNotIn("address", response.context["form"].fields)
-
-        # bring it back to android
-        channel.channel_type = Channel.TYPE_ANDROID
-        channel.save()
-
-        # visit the channel's update page as administrator
-        self.org.administrators.add(self.user)
-        self.user.set_org(self.org)
-        response = self.fetch_protected(update_url, self.user)
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(response.request["PATH_INFO"], update_url)
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Test Channel Update1")
-        self.assertEqual(channel.address, "+250785551313")
-
-        postdata = dict()
-        postdata["name"] = "Test Channel Update2"
-        postdata["address"] = "+250785551414"
-
-        response = self.fetch_protected(update_url, self.user, postdata)
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Test Channel Update2")
-        self.assertEqual(channel.address, "+250785551414")
-
-        # visit the channel's update page as superuser
-        self.superuser.set_org(self.org)
-        response = self.fetch_protected(update_url, self.superuser)
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(response.request["PATH_INFO"], update_url)
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Test Channel Update2")
-        self.assertEqual(channel.address, "+250785551414")
-
-        postdata = dict()
-        postdata["name"] = "Test Channel Update3"
-        postdata["address"] = "+250785551515"
-
-        response = self.fetch_protected(update_url, self.superuser, postdata)
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Test Channel Update3")
-        self.assertEqual(channel.address, "+250785551515")
-
-        # make sure channel works with alphanumeric numbers
-        channel.address = "EATRIGHT"
-        self.assertEqual("EATRIGHT", channel.get_address_display())
-        self.assertEqual("EATRIGHT", channel.get_address_display(e164=True))
-
-        # change channel type to Twitter
-        channel.channel_type = "TWT"
-        channel.schemes = [TWITTER_SCHEME]
-        channel.address = "billy_bob"
-        channel.scheme = "twitter"
-        channel.config = {"handle_id": 12345, "oauth_token": "abcdef", "oauth_token_secret": "23456"}
-        channel.save()
-
-        self.assertEqual("@billy_bob", channel.get_address_display())
-        self.assertEqual("@billy_bob", channel.get_address_display(e164=True))
-
-        response = self.fetch_protected(update_url, self.user)
-        self.assertEqual(200, response.status_code)
-        self.assertIn("name", response.context["fields"])
-        self.assertIn("alert_email", response.context["fields"])
-        self.assertIn("address", response.context["fields"])
-        self.assertNotIn("country", response.context["fields"])
-
-        postdata = dict()
-        postdata["name"] = "Twitter2"
-        postdata["alert_email"] = "bob@example.com"
-        postdata["address"] = "billy_bob"
-
-        self.fetch_protected(update_url, self.user, postdata)
-        channel = Channel.objects.get(pk=self.tel_channel.id)
-        self.assertEqual(channel.name, "Twitter2")
-        self.assertEqual(channel.alert_email, "bob@example.com")
-        self.assertEqual(channel.address, "billy_bob")
-
     def test_read(self):
-        post_data = dict(
+        # now send the channel's updates
+        self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="CHA", p_src="BAT", p_lvl="60", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
 
         # now send the channel's updates
-        self.sync(self.tel_channel, post_data)
-        post_data = dict(
+        self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="FUL", p_src="AC", p_lvl="100", net="WIFI", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        self.sync(self.tel_channel, post_data)
         self.assertEqual(2, SyncEvent.objects.all().count())
 
         # non-org users can't view our channels
@@ -836,17 +618,14 @@ class ChannelTest(TembaTest):
 
         self.assertTrue(len(response.context["latest_sync_events"]) <= 5)
 
-        response = self.fetch_protected(reverse("orgs.org_home"), self.admin)
+        response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.admin)
         self.assertNotContains(response, "Enable Voice")
 
         # Add twilio credentials to make sure we can add calling for our android channel
-        twilio_config = {ACCOUNT_SID: "SID", ACCOUNT_TOKEN: "TOKEN", APPLICATION_SID: "APP SID"}
-        config = self.org.config
-        config.update(twilio_config)
-        self.org.config = config
-        self.org.save(update_fields=["config"])
+        self.org.config.update({Org.CONFIG_TWILIO_SID: "SID", Org.CONFIG_TWILIO_TOKEN: "TOKEN"})
+        self.org.save(update_fields=("config",))
 
-        response = self.fetch_protected(reverse("orgs.org_home"), self.admin)
+        response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.admin)
         self.assertTrue(self.org.is_connected_to_twilio())
         self.assertContains(response, "Enable Voice")
 
@@ -861,9 +640,11 @@ class ChannelTest(TembaTest):
             sync.created_on = two_hours_ago
             sync.save()
 
+        bob = self.create_contact("Bob", phone="+250785551212")
+
         # add a message, just sent so shouldn't be delayed
         with patch("django.utils.timezone.now", return_value=two_hours_ago):
-            Msg.create_outgoing(self.org, self.user, "tel:250785551212", "delayed message")
+            self.create_outgoing_msg(bob, "delayed message", status=Msg.STATUS_QUEUED, channel=self.tel_channel)
 
         response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.admin)
         self.assertIn("delayed_sync_event", response.context_data.keys())
@@ -874,8 +655,7 @@ class ChannelTest(TembaTest):
         self.assertEqual(200, response.status_code)
 
         # now that we can access the channel, which messages do we display in the chart?
-        joe = self.create_contact("Joe", "+2501234567890")
-        test_contact = Contact.get_test_contact(self.admin)
+        joe = self.create_contact("Joe", phone="+2501234567890")
 
         # should have two series, one for incoming one for outgoing
         self.assertEqual(2, len(response.context["message_stats"]))
@@ -892,27 +672,9 @@ class ChannelTest(TembaTest):
         self.assertEqual(0, response.context["message_stats_table"][0]["incoming_ivr_count"])
         self.assertEqual(0, response.context["message_stats_table"][0]["outgoing_ivr_count"])
 
-        # send messages with a test contact
-        Msg.create_incoming(self.tel_channel, str(test_contact.get_urn()), "This incoming message will not be counted")
-        Msg.create_outgoing(self.org, self.user, test_contact, "This outgoing message will not be counted")
-
-        response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.superuser)
-        self.assertEqual(200, response.status_code)
-
-        # nothing should change since it's a test contact
-        self.assertEqual(0, len(response.context["message_stats"][0]["data"]))
-        self.assertEqual(1, response.context["message_stats"][1]["data"][-1]["count"])
-
-        # no change on the table starts too
-        self.assertEqual(1, len(response.context["message_stats_table"]))
-        self.assertEqual(0, response.context["message_stats_table"][0]["incoming_messages_count"])
-        self.assertEqual(1, response.context["message_stats_table"][0]["outgoing_messages_count"])
-        self.assertEqual(0, response.context["message_stats_table"][0]["incoming_ivr_count"])
-        self.assertEqual(0, response.context["message_stats_table"][0]["outgoing_ivr_count"])
-
-        # send messages with a normal contact
-        Msg.create_incoming(self.tel_channel, str(joe.get_urn(TEL_SCHEME)), "This incoming message will be counted")
-        Msg.create_outgoing(self.org, self.user, joe, "This outgoing message will be counted")
+        # send messages
+        self.create_incoming_msg(joe, "This incoming message will be counted", channel=self.tel_channel)
+        self.create_outgoing_msg(joe, "This outgoing message will be counted", channel=self.tel_channel)
 
         # now we have an inbound message and two outbounds
         response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.superuser)
@@ -933,26 +695,9 @@ class ChannelTest(TembaTest):
         self.tel_channel.role = "SCAR"
         self.tel_channel.save()
 
-        from temba.msgs.models import IVR
-
-        Msg.create_incoming(
-            self.tel_channel, str(test_contact.get_urn()), "incoming ivr as a test contact", msg_type=IVR
-        )
-        Msg.create_outgoing(self.org, self.user, test_contact, "outgoing ivr as a test contact", msg_type=IVR)
-        response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.superuser)
-
-        # nothing should have changed
-        self.assertEqual(2, len(response.context["message_stats"]))
-
-        self.assertEqual(1, len(response.context["message_stats_table"]))
-        self.assertEqual(1, response.context["message_stats_table"][0]["incoming_messages_count"])
-        self.assertEqual(2, response.context["message_stats_table"][0]["outgoing_messages_count"])
-        self.assertEqual(0, response.context["message_stats_table"][0]["incoming_ivr_count"])
-        self.assertEqual(0, response.context["message_stats_table"][0]["outgoing_ivr_count"])
-
-        # now let's create an ivr interaction from a real contact
-        Msg.create_incoming(self.tel_channel, str(joe.get_urn()), "incoming ivr", msg_type=IVR)
-        Msg.create_outgoing(self.org, self.user, joe, "outgoing ivr", msg_type=IVR)
+        # now let's create an ivr interaction
+        self.create_incoming_msg(joe, "incoming ivr", channel=self.tel_channel, msg_type=Msg.TYPE_IVR)
+        self.create_outgoing_msg(joe, "outgoing ivr", channel=self.tel_channel, msg_type=Msg.TYPE_IVR)
         response = self.fetch_protected(reverse("channels.channel_read", args=[self.tel_channel.uuid]), self.superuser)
 
         self.assertEqual(4, len(response.context["message_stats"]))
@@ -989,6 +734,11 @@ class ChannelTest(TembaTest):
         self.assertEqual(401, response.status_code)
         self.assertEqual(3, response.json()["error_id"])
 
+        # missing initial FCM command
+        response = self.sync(self.tel_channel, cmds=[], auto_add_fcm=False)
+        self.assertEqual(401, response.status_code)
+        self.assertEqual(4, response.json()["error_id"])
+
     def test_claim(self):
         # no access for regular users
         self.login(self.user)
@@ -1004,10 +754,6 @@ class ChannelTest(TembaTest):
         self.login(self.admin)
         response = self.client.get(reverse("channels.channel_claim"))
         self.assertEqual(200, response.status_code)
-        self.assertEqual(
-            response.context["twilio_countries"],
-            "Belgium, Canada, Finland, Norway, Poland, Spain, " "Sweden, United Kingdom or United States",
-        )
 
         # one recommended channel (Mtarget in Rwanda)
         self.assertEqual(len(response.context["recommended_channels"]), 2)
@@ -1031,39 +777,104 @@ class ChannelTest(TembaTest):
 
         self.assertEqual(response.context["channel_types"]["PHONE"][0].code, "CT")
         self.assertEqual(response.context["channel_types"]["PHONE"][1].code, "EX")
-        self.assertEqual(response.context["channel_types"]["PHONE"][2].code, "IB")
-        self.assertEqual(response.context["channel_types"]["PHONE"][3].code, "JS")
+        self.assertEqual(response.context["channel_types"]["PHONE"][2].code, "I2")
+        self.assertEqual(response.context["channel_types"]["PHONE"][3].code, "IB")
+        self.assertEqual(response.context["channel_types"]["PHONE"][4].code, "JS")
 
-    def test_register_and_claim_android(self):
+    def test_claim_all(self):
+        # no access for regular users
+        self.login(self.user)
+        response = self.client.get(reverse("channels.channel_claim_all"))
+        self.assertLoginRedirect(response)
+
+        # editor can access
+        self.login(self.editor)
+        response = self.client.get(reverse("channels.channel_claim_all"))
+        self.assertEqual(200, response.status_code)
+
+        # as can admins
+        self.login(self.admin)
+        response = self.client.get(reverse("channels.channel_claim_all"))
+        self.assertEqual(200, response.status_code)
+
+        # should see all channel types not for beta only and having a category
+        self.assertEqual(len(response.context["recommended_channels"]), 2)
+
+        self.assertEqual(response.context["channel_types"]["PHONE"][0].code, "AC")
+        self.assertEqual(response.context["channel_types"]["PHONE"][1].code, "T")
+        self.assertEqual(response.context["channel_types"]["PHONE"][2].code, "TMS")
+        self.assertEqual(response.context["channel_types"]["PHONE"][-2].code, "YO")
+        self.assertEqual(response.context["channel_types"]["PHONE"][-1].code, "ZVS")
+
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][0].code, "D3")
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][1].code, "ZVW")
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][2].code, "TWA")
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][3].code, "FBA")
+
+        self.admin.groups.add(Group.objects.get(name="Beta"))
+
+        response = self.client.get(reverse("channels.channel_claim_all"))
+        self.assertEqual(200, response.status_code)
+
+        # should see all channel types having a category including beta only channel types
+        self.assertEqual(len(response.context["recommended_channels"]), 2)
+
+        self.assertEqual(response.context["channel_types"]["PHONE"][0].code, "AC")
+        self.assertEqual(response.context["channel_types"]["PHONE"][1].code, "T")
+        self.assertEqual(response.context["channel_types"]["PHONE"][2].code, "TMS")
+        self.assertEqual(response.context["channel_types"]["PHONE"][-2].code, "YO")
+        self.assertEqual(response.context["channel_types"]["PHONE"][-1].code, "ZVS")
+
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][0].code, "WA")
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][1].code, "D3")
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][2].code, "ZVW")
+        self.assertEqual(response.context["channel_types"]["SOCIAL_MEDIA"][3].code, "TWA")
+
+    def test_register_unsupported_android(self):
         # remove our explicit country so it needs to be derived from channels
         self.org.country = None
         self.org.save()
 
         Channel.objects.all().delete()
 
-        reg_data = dict(cmds=[dict(cmd="fcm", fcm_id="FCM111", uuid="uuid"), dict(cmd="status", cc="RW", dev="Nexus")])
+        reg_data = dict(cmds=[dict(cmd="gcm", gcm_id="GCM111", uuid="uuid"), dict(cmd="status", cc="RW", dev="Nexus")])
 
-        # must be a post
-        response = self.client.get(reverse("register"), content_type="application/json")
-        self.assertEqual(500, response.status_code)
-
-        # try a legit register
+        # try a post register
         response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
         self.assertEqual(200, response.status_code)
 
-        android1 = Channel.objects.get()
-        self.assertIsNone(android1.org)
-        self.assertIsNone(android1.address)
-        self.assertIsNone(android1.alert_email)
-        self.assertEqual(android1.country, "RW")
-        self.assertEqual(android1.device, "Nexus")
-        self.assertEqual(android1.config["FCM_ID"], "FCM111")
-        self.assertEqual(android1.uuid, "uuid")
-        self.assertTrue(android1.secret)
-        self.assertTrue(android1.claim_code)
-        self.assertEqual(android1.created_by, get_anonymous_user())
+        response_json = response.json()
+        self.assertEqual(
+            response_json,
+            dict(cmds=[dict(cmd="reg", relayer_claim_code="*********", relayer_secret="0" * 64, relayer_id=-1)]),
+        )
 
-        # check channel JSON in response
+        # missing uuid raises
+        reg_data = dict(cmds=[dict(cmd="fcm", fcm_id="FCM111"), dict(cmd="status", cc="RW", dev="Nexus")])
+
+        with self.assertRaises(ValueError):
+            self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
+
+        # missing fcm_id raises
+        reg_data = dict(cmds=[dict(cmd="fcm", uuid="uuid"), dict(cmd="status", cc="RW", dev="Nexus")])
+        with self.assertRaises(ValueError):
+            self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
+
+    def test_sync_unclaimed(self):
+        response = self.sync(self.unclaimed_channel, cmds=[])
+        self.assertEqual(401, response.status_code)
+
+        # should be an error response
+        self.assertEqual({"error": "Can't sync unclaimed channel", "error_id": 4, "cmds": []}, response.json())
+
+        self.unclaimed_channel.secret = "12345674674"
+        self.unclaimed_channel.uuid = generate_uuid()
+        self.unclaimed_channel.claim_code = "ABCDEFGH9"
+        self.unclaimed_channel.save(update_fields=("secret", "uuid", "claim_code"))
+
+        response = self.sync(self.unclaimed_channel, cmds=[])
+        self.assertEqual(200, response.status_code)
+
         response_json = response.json()
         self.assertEqual(
             response_json,
@@ -1071,519 +882,39 @@ class ChannelTest(TembaTest):
                 cmds=[
                     dict(
                         cmd="reg",
-                        relayer_claim_code=android1.claim_code,
-                        relayer_secret=android1.secret,
-                        relayer_id=android1.id,
+                        relayer_claim_code="ABCDEFGH9",
+                        relayer_secret="12345674674",
+                        relayer_id=self.unclaimed_channel.pk,
                     )
                 ]
             ),
         )
 
-        # try registering again with same details
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        self.assertEqual(response.status_code, 200)
-
-        android1 = Channel.objects.get()
-        response_json = response.json()
-
-        self.assertEqual(
-            response_json,
-            dict(
-                cmds=[
-                    dict(
-                        cmd="reg",
-                        relayer_claim_code=android1.claim_code,
-                        relayer_secret=android1.secret,
-                        relayer_id=android1.id,
-                    )
-                ]
-            ),
+        # Not matching UUID should be an error
+        response = self.sync(
+            self.unclaimed_channel,
+            cmds=[{"cmd": "fcm", "fcm_id": "3256262", "uuid": str(generate_uuid()), "p_id": 1}],
+            auto_add_fcm=False,
         )
+        self.assertEqual(401, response.status_code)
 
-        # try to claim as non-admin
-        self.login(self.user)
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=android1.claim_code, phone_number="0788123123")
-        )
-        self.assertLoginRedirect(response)
+        # should be an error response
+        self.assertEqual({"error": "Can't sync unclaimed channel", "error_id": 4, "cmds": []}, response.json())
 
-        # try to claim with an invalid phone number
-        self.login(self.admin)
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=android1.claim_code, phone_number="078123")
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form", "phone_number", "Invalid phone number, try again.")
+    @mock_mailroom
+    def test_sync_client_reset(self, mr_mocks):
+        android = self.claim_new_android()
 
-        # claim our channel
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=android1.claim_code, phone_number="0788123123")
-        )
-
-        # redirect to welcome page
-        self.assertIn("success", response.get("Location", None))
-        self.assertRedirect(response, reverse("public.public_welcome"))
-
-        # channel is updated with org details and claim code is now blank
-        android1.refresh_from_db()
-        secret = android1.secret
-        self.assertEqual(android1.org, self.org)
-        self.assertEqual(android1.address, "+250788123123")  # normalized
-        self.assertEqual(android1.alert_email, self.admin.email)  # the logged-in user
-        self.assertEqual(android1.config["FCM_ID"], "FCM111")
-        self.assertEqual(android1.uuid, "uuid")
-        self.assertFalse(android1.claim_code)
-
-        # try having a device register again
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        self.assertEqual(response.status_code, 200)
-
-        # should return same channel but with a new claim code and secret
-        android1.refresh_from_db()
-        self.assertEqual(android1.org, self.org)
-        self.assertEqual(android1.address, "+250788123123")
-        self.assertEqual(android1.alert_email, self.admin.email)
-        self.assertEqual(android1.config["FCM_ID"], "FCM111")
-        self.assertEqual(android1.uuid, "uuid")
-        self.assertEqual(android1.is_active, True)
-        self.assertTrue(android1.claim_code)
-        self.assertNotEqual(android1.secret, secret)
-
-        # should be able to claim again
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=android1.claim_code, phone_number="0788123123")
-        )
-        self.assertRedirect(response, reverse("public.public_welcome"))
-
-        # try having a device register yet again with new FCM ID
-        reg_data["cmds"][0]["fcm_id"] = "FCM222"
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        self.assertEqual(response.status_code, 200)
-
-        # should return same channel but with FCM updated
-        android1.refresh_from_db()
-        self.assertEqual(android1.org, self.org)
-        self.assertEqual(android1.address, "+250788123123")
-        self.assertEqual(android1.alert_email, self.admin.email)
-        self.assertEqual(android1.config["FCM_ID"], "FCM222")
-        self.assertEqual(android1.uuid, "uuid")
-        self.assertEqual(android1.is_active, True)
-
-        # we can claim again with new phone number
-        response = self.client.post(
-            reverse("channels.channel_claim_android"),
-            dict(claim_code=android1.claim_code, phone_number="+250788123124"),
-        )
-        self.assertRedirect(response, reverse("public.public_welcome"))
-
-        android1.refresh_from_db()
-        self.assertEqual(android1.org, self.org)
-        self.assertEqual(android1.address, "+250788123124")
-        self.assertEqual(android1.alert_email, self.admin.email)
-        self.assertEqual(android1.config["FCM_ID"], "FCM222")
-        self.assertEqual(android1.uuid, "uuid")
-        self.assertEqual(android1.is_active, True)
-
-        # release and then register with same details and claim again
-        old_uuid = android1.uuid
-        android1.release()
-
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        claim_code = response.json()["cmds"][0]["relayer_claim_code"]
-        self.assertEqual(response.status_code, 200)
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=claim_code, phone_number="+250788123124")
-        )
-        self.assertRedirect(response, reverse("public.public_welcome"))
-
-        android1.refresh_from_db()
-
-        self.assertNotEqual(android1.uuid, old_uuid)  # inactive channel now has new UUID
-
-        # and we have a new Android channel with our UUID
-        android2 = Channel.objects.get(is_active=True)
-        self.assertNotEqual(android2, android1)
-        self.assertEqual(android2.uuid, "uuid")
-
-        # try to claim a bogus channel
-        response = self.client.post(reverse("channels.channel_claim_android"), dict(claim_code="Your Mom"))
-        self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form", "claim_code", "Invalid claim code, please check and try again.")
-
-        # check our primary tel channel is the same as our outgoing
-        default_sender = self.org.get_send_channel(TEL_SCHEME)
-        self.assertEqual(default_sender, android2)
-        self.assertEqual(default_sender, self.org.get_receive_channel(TEL_SCHEME))
-        self.assertFalse(default_sender.is_delegate_sender())
-
-        response = self.client.get(reverse("channels.channel_bulk_sender_options"))
-        self.assertEqual(response.status_code, 200)
-
-        response = self.client.post(
-            reverse("channels.channel_create_bulk_sender") + "?connection=NX", dict(connection="NX")
-        )
-        self.assertFormError(response, "form", "channel", "Can't add sender for that number")
-
-        # try to claim a bulk Nexmo sender (without adding Nexmo account to org)
-        claim_nexmo_url = reverse("channels.channel_create_bulk_sender") + "?connection=NX&channel=%d" % android2.pk
-        response = self.client.post(claim_nexmo_url, dict(connection="NX", channel=android2.pk))
-        self.assertFormError(response, "form", "connection", "A connection to a Nexmo account is required")
-
-        # send channel is still our Android device
-        self.assertEqual(self.org.get_send_channel(TEL_SCHEME), android2)
-        self.assertFalse(self.org.is_connected_to_nexmo())
-
-        # now connect to nexmo
-        with patch("temba.utils.nexmo.NexmoClient.update_account") as connect:
-            connect.return_value = True
-            with patch("nexmo.Client.create_application") as create_app:
-                create_app.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
-                self.org.connect_nexmo("123", "456", self.admin)
-                self.org.save()
-        self.assertTrue(self.org.is_connected_to_nexmo())
-
-        # now adding Nexmo bulk sender should work
-        response = self.client.post(claim_nexmo_url, dict(connection="NX", channel=android2.pk))
-        self.assertRedirect(response, reverse("orgs.org_home"))
-
-        # new Nexmo channel created for delegated sending
-        nexmo = self.org.get_send_channel(TEL_SCHEME)
-        self.assertEqual(nexmo.channel_type, "NX")
-        self.assertEqual(nexmo.parent, android2)
-        self.assertTrue(nexmo.is_delegate_sender())
-        self.assertEqual(nexmo.tps, 1)
-        channel_config = nexmo.config
-        self.assertEqual(channel_config[Channel.CONFIG_NEXMO_API_KEY], "123")
-        self.assertEqual(channel_config[Channel.CONFIG_NEXMO_API_SECRET], "456")
-        self.assertEqual(channel_config[Channel.CONFIG_NEXMO_APP_ID], "app-id")
-        self.assertEqual(channel_config[Channel.CONFIG_NEXMO_APP_PRIVATE_KEY], "private-key\n")
-
-        # reading our nexmo channel should now offer a disconnect option
-        nexmo = self.org.channels.filter(channel_type="NX").first()
-        response = self.client.get(reverse("channels.channel_read", args=[nexmo.uuid]))
-        self.assertContains(response, "Disable Bulk Sending")
-
-        # receiving still job of our Android device
-        self.assertEqual(self.org.get_receive_channel(TEL_SCHEME), android2)
-
-        # re-register device with country as US
-        reg_data = dict(
-            cmds=[dict(cmd="fcm", fcm_id="FCM222", uuid="uuid"), dict(cmd="status", cc="US", dev="Nexus 5X")]
-        )
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        self.assertEqual(response.status_code, 200)
-
-        # channel country and device updated
-        android2.refresh_from_db()
-        self.assertEqual(android2.country, "US")
-        self.assertEqual(android2.device, "Nexus 5X")
-        self.assertEqual(android2.org, self.org)
-        self.assertEqual(android2.config["FCM_ID"], "FCM222")
-        self.assertEqual(android2.uuid, "uuid")
-        self.assertTrue(android2.is_active)
-
-        # set back to RW...
-        android2.country = "RW"
-        android2.save()
-
-        # our country is RW
-        self.assertEqual(self.org.get_country_code(), "RW")
-
-        # remove nexmo
-        nexmo.release()
-
-        self.assertEqual(self.org.get_country_code(), "RW")
-
-        # register another device with country as US
-        reg_data = dict(
-            cmds=[dict(cmd="fcm", fcm_id="FCM444", uuid="uuid4"), dict(cmd="status", cc="US", dev="Nexus 6P")]
-        )
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-
-        claim_code = response.json()["cmds"][0]["relayer_claim_code"]
-
-        # try to claim it...
-        self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=claim_code, phone_number="12065551212")
-        )
-
-        # should work, can have two channels in different countries
-        channel = Channel.objects.get(country="US")
-        self.assertEqual(channel.address, "+12065551212")
-
-        self.assertEqual(Channel.objects.filter(org=self.org, is_active=True).count(), 2)
-
-        # normalize a URN with a fully qualified number
-        number, valid = URN.normalize_number("+12061112222", None)
-        self.assertTrue(valid)
-
-        # not international format
-        number, valid = URN.normalize_number("0788383383", None)
-        self.assertFalse(valid)
-
-        # get our send channel without a URN, should just default to last
-        default_channel = self.org.get_send_channel(TEL_SCHEME)
-        self.assertEqual(default_channel, channel)
-
-        # get our send channel for a Rwandan URN
-        rwanda_channel = self.org.get_send_channel(TEL_SCHEME, ContactURN.create(self.org, None, "tel:+250788383383"))
-        self.assertEqual(rwanda_channel, android2)
-
-        # and a US one
-        us_channel = self.org.get_send_channel(TEL_SCHEME, ContactURN.create(self.org, None, "tel:+12065555353"))
-        self.assertEqual(us_channel, channel)
-
-        # a different country altogether should just give us the default
-        us_channel = self.org.get_send_channel(TEL_SCHEME, ContactURN.create(self.org, None, "tel:+593997290044"))
-        self.assertEqual(us_channel, channel)
-
-        self.org = Org.objects.get(id=self.org.id)
-        self.assertIsNone(self.org.get_country_code())
-
-        # yet another registration in rwanda
-        reg_data = dict(
-            cmds=[dict(cmd="fcm", fcm_id="FCM555", uuid="uuid5"), dict(cmd="status", cc="RW", dev="Nexus 5")]
-        )
-        response = self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        claim_code = response.json()["cmds"][0]["relayer_claim_code"]
-
-        # try to claim it with number taken by other Android channel
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=claim_code, phone_number="+250788123124")
-        )
-        self.assertFormError(
-            response, "form", "phone_number", "Another channel has this number. Please remove that channel first."
-        )
-
-        # create channel in another org
-        self.create_secondary_org()
-        Channel.create(self.org2, self.admin2, "RW", "A", "", "+250788382382")
-
-        # can claim it with this number, and because it's a fully qualified RW number, doesn't matter that channel is US
-        response = self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=claim_code, phone_number="+250788382382")
-        )
-        self.assertRedirect(response, reverse("public.public_welcome"))
-
-        # should be added with RW as the country
-        self.assertTrue(Channel.objects.get(address="+250788382382", country="RW", org=self.org))
-
-    def test_search_nexmo(self):
-        self.login(self.admin)
-        self.org.channels.update(is_active=False)
-        self.channel = Channel.create(
-            self.org, self.user, "RW", "NX", None, "+250788123123", uuid="00000000-0000-0000-0000-000000001234"
-        )
-
-        self.nexmo_uuid = str(uuid.uuid4())
-        nexmo_config = {
-            NEXMO_KEY: "1234",
-            NEXMO_SECRET: "1234",
-            NEXMO_UUID: self.nexmo_uuid,
-            NEXMO_APP_ID: "nexmo-app-id",
-            NEXMO_APP_PRIVATE_KEY: "nexmo-private-key\n",
-        }
-
-        org = self.channel.org
-
-        config = org.config
-        config.update(nexmo_config)
-        org.config = config
-        org.save()
-
-        search_nexmo_url = reverse("channels.channel_search_nexmo")
-
-        response = self.client.get(search_nexmo_url)
-        self.assertIn("area_code", response.context["form"].fields)
-        self.assertIn("country", response.context["form"].fields)
-
-        with patch("requests.get") as nexmo_get:
-            nexmo_get.side_effect = [
-                MockResponse(
-                    200,
-                    '{"count":1,"numbers":[{"features": ["SMS", "VOICE"], '
-                    '"type":"mobile-lvn","country":"US","msisdn":"13607884540"}] }',
-                ),
-                MockResponse(
-                    200,
-                    '{"count":1,"numbers":[{"features": ["SMS", "VOICE"], '
-                    '"type":"mobile-lvn","country":"US","msisdn":"13607884550"}] }',
-                ),
-            ]
-
-            post_data = dict(country="US", area_code="360")
-            response = self.client.post(search_nexmo_url, post_data, follow=True)
-
-            self.assertEqual(response.json(), ["+1 360-788-4540", "+1 360-788-4550"])
-
-    def test_plivo_search_numbers(self):
-        self.login(self.admin)
-
-        plivo_search_url = reverse("channels.channel_search_plivo")
-
-        with patch("requests.get") as plivo_get:
-            plivo_get.return_value = MockResponse(200, json.dumps(dict(objects=[])))
-
-            response = self.client.post(plivo_search_url, dict(country="US", area_code=""), follow=True)
-
-            self.assertEqual(response.status_code, 200)
-            self.assertNotContains(response, "error")
-
-            # missing key to throw exception
-            plivo_get.return_value = MockResponse(200, json.dumps(dict()))
-            response = self.client.post(plivo_search_url, dict(country="US", area_code=""), follow=True)
-
-            self.assertEqual(response.status_code, 200)
-            self.assertContains(response, "error")
-
-            plivo_get.side_effect = [
-                MockResponse(200, json.dumps(dict())),  # get account in pre_process
-                MockResponse(400, "Bad request"),  # failed search numbers
-            ]
-            response = self.client.post(plivo_search_url, dict(country="US", area_code=""), follow=True)
-
-            self.assertContains(response, "Bad request")
-
-    def test_release(self):
-        Channel.objects.all().delete()
-        self.login(self.admin)
-
-        # register and claim an Android channel
-        reg_data = dict(cmds=[dict(cmd="fcm", fcm_id="FCM111", uuid="uuid"), dict(cmd="status", cc="RW", dev="Nexus")])
-        self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        android = Channel.objects.get()
-        self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=android.claim_code, phone_number="0788123123")
-        )
-        android.refresh_from_db()
-
-        # connect org to Nexmo and add bulk sender
-        with patch("temba.utils.nexmo.NexmoClient.update_account") as connect:
-            connect.return_value = True
-            with patch("nexmo.Client.create_application") as create_app:
-                create_app.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
-                self.org.connect_nexmo("123", "456", self.admin)
-                self.org.save()
-
-        claim_nexmo_url = reverse("channels.channel_create_bulk_sender") + "?connection=NX&channel=%d" % android.pk
-        self.client.post(claim_nexmo_url, dict(connection="NX", channel=android.pk))
-        nexmo = Channel.objects.get(channel_type="NX")
-
-        android.release()
-
-        # check that some details are cleared and channel is now inactive
-        self.assertFalse(android.is_active)
-        self.assertFalse(android.config.get(Channel.CONFIG_FCM_ID))
-
-        # Nexmo delegate should have been released as well
-        nexmo.refresh_from_db()
-        self.assertFalse(nexmo.is_active)
-        self.releaseChannels(delete=True)
-
-        # register and claim an Android channel
-        reg_data = dict(cmds=[dict(cmd="fcm", fcm_id="FCM111", uuid="uuid"), dict(cmd="status", cc="RW", dev="Nexus")])
-        self.client.post(reverse("register"), json.dumps(reg_data), content_type="application/json")
-        android = Channel.objects.get()
-        self.client.post(
-            reverse("channels.channel_claim_android"), dict(claim_code=android.claim_code, phone_number="0788123123")
-        )
-        android.refresh_from_db()
-        # simulate no FCM ID
-        android.config.pop(Channel.CONFIG_FCM_ID, None)
-        android.save()
-
-        android.release()
-
-        # check that some details are cleared and channel is now in active
-        self.assertFalse(android.is_active)
-        self.assertFalse(android.config.get(Channel.CONFIG_FCM_ID))
-
-    @override_settings(IS_PROD=True)
-    def test_release_ivr_channel(self):
-
-        # create outgoing call for the channel
-        contact = self.create_contact("Bruno Mars", "+252788123123")
-        call = IVRCall.create_outgoing(self.tel_channel, contact, contact.get_urn(TEL_SCHEME), self.admin)
-
-        self.assertNotEqual(call.status, ChannelConnection.INTERRUPTED)
-        self.tel_channel.release()
-
-        call.refresh_from_db()
-        self.assertEqual(call.status, ChannelConnection.INTERRUPTED)
-
-    def test_unclaimed(self):
-        response = self.sync(self.unclaimed_channel)
+        response = self.sync(android, cmds=[{"cmd": "reset"}])
         self.assertEqual(200, response.status_code)
-        response = response.json()
 
-        # should be a registration command containing a new claim code
-        self.assertEqual(response["cmds"][0]["cmd"], "reg")
+        android.refresh_from_db()
+        self.assertFalse(android.is_active)
 
-        post_data = dict(
-            cmds=[
-                dict(
-                    cmd="status",
-                    org_id=self.unclaimed_channel.pk,
-                    p_lvl=84,
-                    net="WIFI",
-                    p_sts="CHA",
-                    p_src="USB",
-                    pending=[],
-                    retry=[],
-                )
-            ]
-        )
-
-        # try syncing against the unclaimed channel that has a secret
-        self.unclaimed_channel.secret = "999"
-        self.unclaimed_channel.save()
-
-        response = self.sync(self.unclaimed_channel, post_data=post_data)
-        response = response.json()
-
-        # registration command
-        self.assertEqual(response["cmds"][0]["cmd"], "reg")
-
-        # claim the channel on the site
-        self.unclaimed_channel.org = self.org
-        self.unclaimed_channel.save()
-
-        post_data = dict(
-            cmds=[
-                dict(
-                    cmd="status",
-                    org_id="-1",
-                    p_lvl=84,
-                    net="WIFI",
-                    p_sts="STATUS_CHARGING",
-                    p_src="USB",
-                    pending=[],
-                    retry=[],
-                )
-            ]
-        )
-
-        response = self.sync(self.unclaimed_channel, post_data=post_data)
-        response = response.json()
-
-        # should now be a claim command in return
-        self.assertEqual(response["cmds"][0]["cmd"], "claim")
-
-        # now try releasing the channel from the client
-        post_data = dict(cmds=[dict(cmd="reset", p_id=1)])
-
-        response = self.sync(self.unclaimed_channel, post_data=post_data)
-        response = response.json()
-
-        # channel should be released now
-        channel = Channel.objects.get(pk=self.unclaimed_channel.pk)
-        self.assertFalse(channel.is_active)
-
-    def test_quota_exceeded(self):
-        # set our org to be on the trial plan
-        self.org.plan = FREE_PLAN
-        self.org.save()
+    def test_no_topup_quota_exceeded(self):
+        # reduce out credits to 10
         self.org.topups.all().update(credits=10)
+        self.org.clear_credit_cache()
 
         self.assertEqual(10, self.org.get_credits_remaining())
         self.assertEqual(0, self.org.get_credits_used())
@@ -1591,7 +922,7 @@ class ChannelTest(TembaTest):
         # if we sync should get one message back
         self.send_message(["250788382382"], "How is it going?")
 
-        response = self.sync(self.tel_channel)
+        response = self.sync(self.tel_channel, cmds=[])
         self.assertEqual(200, response.status_code)
         response = response.json()
         self.assertEqual(1, len(response["cmds"]))
@@ -1599,15 +930,15 @@ class ChannelTest(TembaTest):
         self.assertEqual(9, self.org.get_credits_remaining())
         self.assertEqual(1, self.org.get_credits_used())
 
-        # let's create 10 other messages, this will put our last message above our quota
+        # let's create 10 other messages
         for i in range(10):
             self.send_message(["250788382%03d" % i], "This is message # %d" % i)
 
-        # should get the 10 messages we are allotted back, not the 11 that exist
-        response = self.sync(self.tel_channel)
+        # should send all the 11 messages that exist
+        response = self.sync(self.tel_channel, cmds=[])
         self.assertEqual(200, response.status_code)
         response = response.json()
-        self.assertEqual(10, len(response["cmds"]))
+        self.assertEqual(11, len(response["cmds"]))
 
     def test_sync_broadcast_multiple_channels(self):
         self.org.administrators.add(self.user)
@@ -1625,8 +956,8 @@ class ChannelTest(TembaTest):
             config={Channel.CONFIG_FCM_ID: "456"},
         )
 
-        contact1 = self.create_contact("John Doe", "250788382382")
-        contact2 = self.create_contact("John Doe", "250788383383")
+        contact1 = self.create_contact("John Doe", phone="250788382382")
+        contact2 = self.create_contact("John Doe", phone="250788383383")
 
         contact1_urn = contact1.get_urn()
         contact1_urn.channel = self.tel_channel
@@ -1640,7 +971,7 @@ class ChannelTest(TembaTest):
         self.send_message(["250788382382", "250788383383"], "How is it going?")
 
         # Should contain messages for the the channel only
-        response = self.sync(self.tel_channel)
+        response = self.sync(self.tel_channel, cmds=[])
         self.assertEqual(200, response.status_code)
 
         self.tel_channel.refresh_from_db()
@@ -1652,7 +983,7 @@ class ChannelTest(TembaTest):
         self.assertEqual(cmds[0]["to"][0]["phone"], "+250788382382")
 
         # Should contain messages for the the channel only
-        response = self.sync(channel2)
+        response = self.sync(channel2, cmds=[])
         self.assertEqual(200, response.status_code)
 
         channel2.refresh_from_db()
@@ -1663,9 +994,12 @@ class ChannelTest(TembaTest):
         self.assertEqual(len(cmds[0]["to"]), 1)
         self.assertEqual(cmds[0]["to"][0]["phone"], "+250788383383")
 
-    def test_sync(self):
+    @mock_mailroom
+    def test_sync(self, mr_mocks):
         date = timezone.now()
         date = int(time.mktime(date.timetuple())) * 1000
+
+        contact = self.create_contact("Bob", phone="+250788382382")
 
         # create a payload from the client
         bcast = self.send_message(["250788382382", "250788383383"], "How is it going?")
@@ -1674,17 +1008,18 @@ class ChannelTest(TembaTest):
         msg3 = self.send_message(["250788382382"], "What is your name?")
         msg4 = self.send_message(["250788382382"], "Do you have any children?")
         msg5 = self.send_message(["250788382382"], "What's my dog's name?")
+        msg6 = self.send_message(["250788382382"], "from when?")
 
         # an incoming message that should not be included even if it is still pending
-        incoming_message = Msg.create_incoming(self.tel_channel, "tel:+250788382382", "hey")
-        incoming_message.status = PENDING
-        incoming_message.save()
+        incoming_message = self.create_incoming_msg(
+            contact, "hey", channel=self.tel_channel, status=Msg.STATUS_PENDING
+        )
 
         self.org.administrators.add(self.user)
         self.user.set_org(self.org)
 
         # Check our sync point has all three messages queued for delivery
-        response = self.sync(self.tel_channel)
+        response = self.sync(self.tel_channel, cmds=[])
         self.assertEqual(200, response.status_code)
 
         # check last seen and fcm id were updated
@@ -1692,7 +1027,7 @@ class ChannelTest(TembaTest):
 
         response = response.json()
         cmds = response["cmds"]
-        self.assertEqual(4, len(cmds))
+        self.assertEqual(5, len(cmds))
 
         # assert that our first command is the two message broadcast
         cmd = cmds[0]
@@ -1709,60 +1044,66 @@ class ChannelTest(TembaTest):
         )
 
         # a pending outgoing message should be included
-        Msg.create_outgoing(self.org, self.admin, msg6.contact, "Hello, we heard from you.")
+        self.create_outgoing_msg(
+            msg6.contact, "Hello, we heard from you.", channel=self.tel_channel, status=Msg.STATUS_QUEUED
+        )
 
         six_mins_ago = timezone.now() - timedelta(minutes=6)
         self.tel_channel.last_seen = six_mins_ago
         self.tel_channel.config["FCM_ID"] = "old_fcm_id"
         self.tel_channel.save(update_fields=["last_seen", "config"])
 
-        post_data = dict(
-            cmds=[
-                # device fcm data
-                dict(cmd="fcm", fcm_id="12345", uuid="abcde"),
-                # device details status
-                dict(
-                    cmd="status",
-                    p_sts="DIS",
-                    p_src="BAT",
-                    p_lvl="60",
-                    net="UMTS",
-                    org_id=8,
-                    retry=[msg6.pk],
-                    pending=[],
-                ),
-                # pending incoming message that should be acknowledged but not updated
-                dict(cmd="mt_sent", msg_id=incoming_message.pk, ts=date),
-                # results for the outgoing messages
-                dict(cmd="mt_sent", msg_id=msg1.pk, ts=date),
-                dict(cmd="mt_sent", msg_id=msg2.pk, ts=date),
-                dict(cmd="mt_dlvd", msg_id=msg3.pk, ts=date),
-                dict(cmd="mt_error", msg_id=msg4.pk, ts=date),
-                dict(cmd="mt_fail", msg_id=msg5.pk, ts=date),
-                # a missed call
-                dict(cmd="call", phone="2505551212", type="miss", ts=date),
-                # incoming
-                dict(cmd="call", phone="2505551212", type="mt", dur=10, ts=date),
-                # incoming, invalid URN
-                dict(cmd="call", phone="*", type="mt", dur=10, ts=date),
-                # outgoing
-                dict(cmd="call", phone="+250788383383", type="mo", dur=5, ts=date),
-                # a new incoming message
-                dict(cmd="mo_sms", phone="+250788383383", msg="This is giving me trouble", p_id="1", ts=date),
-                # an incoming message from an empty contact
-                dict(cmd="mo_sms", phone="", msg="This is spam", p_id="2", ts=date),
-            ]
-        )
+        cmds = [
+            # device fcm data
+            dict(cmd="fcm", fcm_id="12345", uuid="abcde"),
+            # device details status
+            dict(
+                cmd="status",
+                p_sts="DIS",
+                p_src="BAT",
+                p_lvl="60",
+                net="UMTS",
+                org_id=8,
+                retry=[msg6.pk],
+                pending=[],
+            ),
+            # pending incoming message that should be acknowledged but not updated
+            dict(cmd="mt_sent", msg_id=incoming_message.pk, ts=date),
+            # results for the outgoing messages
+            dict(cmd="mt_sent", msg_id=msg1.pk, ts=date),
+            dict(cmd="mt_sent", msg_id=msg2.pk, ts=date),
+            dict(cmd="mt_dlvd", msg_id=msg3.pk, ts=date),
+            dict(cmd="mt_error", msg_id=msg4.pk, ts=date),
+            dict(cmd="mt_fail", msg_id=msg5.pk, ts=date),
+            dict(cmd="mt_fail", msg_id=(msg6.pk - 4294967296), ts=date),  # simulate a negative integer from relayer
+            # a missed call
+            dict(cmd="call", phone="2505551212", type="miss", ts=date),
+            # repeated missed calls should be skipped
+            dict(cmd="call", phone="2505551212", type="miss", ts=date),
+            dict(cmd="call", phone="2505551212", type="miss", ts=date),
+            # incoming
+            dict(cmd="call", phone="2505551212", type="mt", dur=10, ts=date),
+            # repeated calls should be skipped
+            dict(cmd="call", phone="2505551212", type="mt", dur=10, ts=date),
+            # incoming, invalid URN
+            dict(cmd="call", phone="*", type="mt", dur=10, ts=date),
+            # outgoing
+            dict(cmd="call", phone="+250788383383", type="mo", dur=5, ts=date),
+            # a new incoming message
+            dict(cmd="mo_sms", phone="+250788383383", msg="This is giving me trouble", p_id="1", ts=date),
+            # an incoming message from an empty contact
+            dict(cmd="mo_sms", phone="", msg="This is spam", p_id="2", ts=date),
+        ]
 
         # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
+        response = self.sync(self.tel_channel, cmds=cmds)
 
         self.tel_channel.refresh_from_db()
         self.assertEqual(self.tel_channel.config["FCM_ID"], "12345")
         self.assertTrue(self.tel_channel.last_seen > six_mins_ago)
 
         # new batch, our ack and our claim command for new org
-        self.assertEqual(4, len(response.json()["cmds"]))
+        self.assertEqual(5, len(response.json()["cmds"]))
         self.assertContains(response, "Hello, we heard from you.")
         self.assertContains(response, "mt_bcast")
 
@@ -1770,7 +1111,7 @@ class ChannelTest(TembaTest):
         self.assertEqual(2, Msg.objects.filter(channel=self.tel_channel, status="S", direction="O").count())
         self.assertEqual(1, Msg.objects.filter(channel=self.tel_channel, status="D", direction="O").count())
         self.assertEqual(1, Msg.objects.filter(channel=self.tel_channel, status="E", direction="O").count())
-        self.assertEqual(1, Msg.objects.filter(channel=self.tel_channel, status="F", direction="O").count())
+        self.assertEqual(2, Msg.objects.filter(channel=self.tel_channel, status="F", direction="O").count())
 
         # we should now have two incoming messages
         self.assertEqual(3, Msg.objects.filter(direction="I").count())
@@ -1781,21 +1122,23 @@ class ChannelTest(TembaTest):
         # We should now have one sync
         self.assertEqual(1, SyncEvent.objects.filter(channel=self.tel_channel).count())
 
+        # We should have 3 channel event
+        self.assertEqual(3, ChannelEvent.objects.filter(channel=self.tel_channel).count())
+
         # check our channel fcm and uuid were updated
         self.tel_channel = Channel.objects.get(pk=self.tel_channel.pk)
         self.assertEqual("12345", self.tel_channel.config["FCM_ID"])
         self.assertEqual("abcde", self.tel_channel.uuid)
 
         # should ignore incoming messages without text
-        post_data = dict(
+        msgs_count = Msg.objects.all().count()
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # incoming msg without text
                 dict(cmd="mo_sms", phone="+250788383383", p_id="1", ts=date)
-            ]
+            ],
         )
-
-        msgs_count = Msg.objects.all().count()
-        response = self.sync(self.tel_channel, post_data)
 
         # no new message
         self.assertEqual(Msg.objects.all().count(), msgs_count)
@@ -1808,15 +1151,13 @@ class ChannelTest(TembaTest):
         self.assertEqual(0, Alert.objects.all().count())
 
         # the case the status must be be reported
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="DIS", p_src="BAT", p_lvl="20", net="UMTS", retry=[], pending=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # we should now have an Alert
         self.assertEqual(1, Alert.objects.all().count())
@@ -1827,15 +1168,13 @@ class ChannelTest(TembaTest):
         )
 
         # the case the status must be be reported but already notification sent
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="DIS", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # we should not create a new alert
         self.assertEqual(1, Alert.objects.all().count())
@@ -1846,15 +1185,13 @@ class ChannelTest(TembaTest):
         )
 
         # Let plug the channel to charger
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="CHA", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # only one alert
         self.assertEqual(1, Alert.objects.all().count())
@@ -1866,23 +1203,20 @@ class ChannelTest(TembaTest):
 
         # make our events old so we can test trimming them
         SyncEvent.objects.all().update(created_on=timezone.now() - timedelta(days=45))
-        SyncEvent.trim()
+        trim_sync_events_task()
 
         # should be cleared out
-        self.assertFalse(SyncEvent.objects.exists())
+        self.assertEqual(1, SyncEvent.objects.all().count())
         self.assertFalse(Alert.objects.exists())
 
         # the case the status is in unknown state
-
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="UNK", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # we should now create a new alert
         self.assertEqual(1, Alert.objects.all().count())
@@ -1893,15 +1227,13 @@ class ChannelTest(TembaTest):
         )
 
         # Let plug the channel to charger to end this unknown power status
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="CHA", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # still only one alert
         self.assertEqual(1, Alert.objects.all().count())
@@ -1915,15 +1247,13 @@ class ChannelTest(TembaTest):
         Alert.objects.all().delete()
 
         # the case the status is in not charging state
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="NOT", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # we should now create a new alert
         self.assertEqual(1, Alert.objects.all().count())
@@ -1934,15 +1264,13 @@ class ChannelTest(TembaTest):
         )
 
         # Let plug the channel to charger to end this unknown power status
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device details status
                 dict(cmd="status", p_sts="CHA", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
-            ]
+            ],
         )
-
-        # now send the channel's updates
-        response = self.sync(self.tel_channel, post_data)
 
         # first we have a new alert created
         self.assertEqual(1, Alert.objects.all().count())
@@ -1952,14 +1280,13 @@ class ChannelTest(TembaTest):
             0, Alert.objects.filter(sync_event__channel=self.tel_channel, ended_on=None, alert_type="P").count()
         )
 
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 # device fcm data
                 dict(cmd="fcm", fcm_id="12345", uuid="abcde")
-            ]
+            ],
         )
-
-        response = self.sync(self.tel_channel, post_data)
 
         self.tel_channel.refresh_from_db()
         self.assertTrue(self.tel_channel.last_seen > six_mins_ago)
@@ -1967,18 +1294,18 @@ class ChannelTest(TembaTest):
 
     def test_signing(self):
         # good signature
-        self.assertEqual(200, self.sync(self.tel_channel).status_code)
+        self.assertEqual(200, self.sync(self.tel_channel, cmds=[]).status_code)
 
         # bad signature, should result in 401 Unauthorized
-        self.assertEqual(401, self.sync(self.tel_channel, signature="badsig").status_code)
+        self.assertEqual(401, self.sync(self.tel_channel, signature="badsig", cmds=[]).status_code)
 
     def test_ignore_android_incoming_msg_invalid_phone(self):
         date = timezone.now()
         date = int(time.mktime(date.timetuple())) * 1000
 
-        post_data = dict(cmds=[dict(cmd="mo_sms", phone="_@", msg="First message", p_id="1", ts=date)])
-
-        response = self.sync(self.tel_channel, post_data)
+        response = self.sync(
+            self.tel_channel, cmds=[dict(cmd="mo_sms", phone="_@", msg="First message", p_id="1", ts=date)]
+        )
         self.assertEqual(200, response.status_code)
 
         responses = response.json()
@@ -1990,22 +1317,22 @@ class ChannelTest(TembaTest):
         self.assertIsNotNone(r0)
         self.assertEqual(r0["cmd"], "ack")
 
-    def test_inbox_duplication(self):
+    @mock_mailroom
+    def test_inbox_duplication(self, mr_mocks):
 
         # if the connection gets interrupted but some messages succeed, we want to make sure subsequent
         # syncs do not result in duplication of messages from the inbox
         date = timezone.now()
         date = int(time.mktime(date.timetuple())) * 1000
 
-        post_data = dict(
+        response = self.sync(
+            self.tel_channel,
             cmds=[
                 dict(cmd="mo_sms", phone="2505551212", msg="First message", p_id="1", ts=date),
                 dict(cmd="mo_sms", phone="2505551212", msg="First message", p_id="2", ts=date),
                 dict(cmd="mo_sms", phone="2505551212", msg="A second message", p_id="3", ts=date),
-            ]
+            ],
         )
-
-        response = self.sync(self.tel_channel, post_data)
         self.assertEqual(200, response.status_code)
 
         responses = response.json()
@@ -2031,69 +1358,6 @@ class ChannelTest(TembaTest):
             if "p_id" in response and response["p_id"] == p_id:
                 return response
 
-    def test_nexmo_create_application(self):
-        from nexmo import Client as NexmoClient
-        from uuid import uuid4
-
-        self.login(self.admin)
-        with patch("requests.post") as nexmo_post:
-            nexmo_post.return_value = MockResponse(
-                200,
-                json.dumps({"id": "app-id", "keys": {"private_key": "private_key"}}),
-                headers={"content-type": "application/json"},
-            )
-
-            nexmo_client = NexmoClient(key="key", secret="secret")
-
-            nexmo_uuid = str(uuid4())
-            domain = self.org.get_brand_domain()
-            app_name = "%s/%s" % (domain, nexmo_uuid)
-
-            answer_url = "https://%s%s" % (domain, reverse("handlers.nexmo_call_handler", args=["answer", nexmo_uuid]))
-
-            event_url = "https://%s%s" % (domain, reverse("handlers.nexmo_call_handler", args=["event", nexmo_uuid]))
-
-            params = dict(
-                name=app_name,
-                type="voice",
-                answer_url=answer_url,
-                answer_method="POST",
-                event_url=event_url,
-                event_method="POST",
-            )
-
-            response = nexmo_client.create_application(params=params)
-            self.assertEqual(response, {"id": "app-id", "keys": {"private_key": "private_key"}})
-
-    @patch("nexmo.Client.update_call")
-    @patch("nexmo.Client.create_application")
-    def test_get_ivr_client(self, mock_create_application, mock_update_call):
-        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
-        mock_update_call.return_value = dict(uuid="12345")
-
-        channel = Channel.create(
-            self.org,
-            self.user,
-            "RW",
-            "A",
-            "Tigo",
-            "+250725551212",
-            secret="11111",
-            config={Channel.CONFIG_FCM_ID: "456"},
-        )
-        self.assertIsNone(channel.get_ivr_client())
-
-        self.org.connect_nexmo("123", "456", self.admin)
-        self.org.save()
-
-        channel.channel_type = "NX"
-        channel.save()
-
-        self.assertIsNotNone(channel.get_ivr_client())
-
-        channel.release()
-        self.assertIsNone(channel.get_ivr_client())
-
     def test_channel_status_processor(self):
 
         request = RequestFactory().get("/")
@@ -2117,50 +1381,190 @@ class ChannelTest(TembaTest):
         Channel.objects.all().delete()
         no_channel_context = channel_status_processor(request)
         self.assertFalse(no_channel_context["has_outgoing_channel"])
-        self.assertEqual(no_channel_context["is_ussd_channel"], False)
 
         sms_context = get_context("JN", Channel.ROLE_SEND)
         self.assertTrue(sms_context["has_outgoing_channel"])
-        self.assertEqual(sms_context["is_ussd_channel"], False)
-
-        ussd_context = get_context("JNU", Channel.ROLE_USSD)
-        self.assertTrue(ussd_context["has_outgoing_channel"])
-        self.assertEqual(ussd_context["is_ussd_channel"], True)
 
 
-class ChannelBatchTest(TembaTest):
-    def test_time_utils(self):
-        now = timezone.now()
-        now = now.replace(microsecond=now.microsecond // 1000 * 1000)
+class ChannelCRUDLTest(TembaTest, CRUDLTestMixin):
+    def setUp(self):
+        super().setUp()
 
-        epoch = datetime_to_ms(now)
-        self.assertEqual(ms_to_datetime(epoch), now)
-
-
-class ChannelEventTest(TembaTest):
-    def test_create(self):
-        now = timezone.now()
-        event = ChannelEvent.create(
-            self.channel, "tel:+250783535665", ChannelEvent.TYPE_CALL_OUT, now, extra=dict(duration=300)
+        self.ex_channel = Channel.create(
+            self.org,
+            self.admin,
+            "RW",
+            "EX",
+            name="External Channel",
+            address="+250785551313",
+            role="SR",
+            schemes=("tel",),
+            config={"send_url": "http://send.com"},
+        )
+        self.other_org_channel = Channel.create(
+            self.org2,
+            self.admin2,
+            "RW",
+            "EX",
+            name="Other Channel",
+            address="+250785551414",
+            role="SR",
+            secret="45473",
+            schemes=("tel",),
+            config={"send_url": "http://send.com"},
         )
 
-        contact = Contact.objects.get()
-        self.assertEqual(str(contact.get_urn()), "tel:+250783535665")
+    def test_configuration(self):
+        config_url = reverse("channels.channel_configuration", args=[self.ex_channel.uuid])
 
-        self.assertEqual(event.org, self.org)
-        self.assertEqual(event.channel, self.channel)
-        self.assertEqual(event.contact, contact)
-        self.assertEqual(event.event_type, ChannelEvent.TYPE_CALL_OUT)
-        self.assertEqual(event.occurred_on, now)
-        self.assertEqual(event.extra["duration"], 300)
+        # can't view configuration if not logged in
+        response = self.client.get(config_url)
+        self.assertLoginRedirect(response)
+
+        self.login(self.admin)
+
+        response = self.client.get(config_url)
+        self.assertContains(response, "To finish configuring your connection")
+
+        # can't view configuration of channel in other org
+        response = self.client.get(reverse("channels.channel_configuration", args=[self.other_org_channel.uuid]))
+        self.assertLoginRedirect(response)
+
+    def test_update(self):
+        android_channel = self.create_channel(
+            "A", "My Android", "+250785551212", country="RW", secret="sesame", config={"FCM_ID": "123"}
+        )
+        vonage_channel = self.create_channel("NX", "My Vonage", "+1234567890", country="US", config={}, role="CASR")
+        telegram_channel = self.create_channel("TG", "My Telegram", "75474745", config={})
+
+        android_url = reverse("channels.channel_update", args=[android_channel.id])
+        vonage_url = reverse("channels.channel_update", args=[vonage_channel.id])
+        telegram_url = reverse("channels.channel_update", args=[telegram_channel.id])
+
+        # fields shown depend on scheme and role
+        self.assertUpdateFetch(
+            android_url,
+            allow_viewers=False,
+            allow_editors=True,
+            form_fields={"name": "My Android", "alert_email": None, "allow_international": False},
+        )
+        self.assertUpdateFetch(
+            vonage_url,
+            allow_viewers=False,
+            allow_editors=True,
+            form_fields={
+                "name": "My Vonage",
+                "alert_email": None,
+                "allow_international": False,
+                "machine_detection": False,
+            },
+        )
+        self.assertUpdateFetch(
+            telegram_url,
+            allow_viewers=False,
+            allow_editors=True,
+            form_fields={"name": "My Telegram", "alert_email": None},
+        )
+
+        # name can't be empty
+        self.assertUpdateSubmit(
+            android_url,
+            {"name": ""},
+            form_errors={"name": "This field is required."},
+            object_unchanged=android_channel,
+        )
+
+        # make some changes
+        self.assertUpdateSubmit(
+            vonage_url,
+            {
+                "name": "Updated Name",
+                "alert_email": "bob@nyaruka.com",
+                "allow_international": True,
+                "machine_detection": True,
+            },
+        )
+
+        vonage_channel.refresh_from_db()
+        self.assertEqual("Updated Name", vonage_channel.name)
+        self.assertEqual("+1234567890", vonage_channel.address)
+        self.assertEqual("bob@nyaruka.com", vonage_channel.alert_email)
+        self.assertTrue(vonage_channel.config.get("allow_international"))
+        self.assertTrue(vonage_channel.config.get("machine_detection"))
+
+        self.assertUpdateFetch(
+            vonage_url,
+            allow_viewers=False,
+            allow_editors=True,
+            form_fields={
+                "name": "Updated Name",
+                "alert_email": "bob@nyaruka.com",
+                "allow_international": True,
+                "machine_detection": True,
+            },
+        )
+
+    def test_delete(self):
+        delete_url = reverse("channels.channel_delete", args=[self.ex_channel.uuid])
+
+        # fetch delete modal
+        response = self.assertDeleteFetch(delete_url, allow_editors=True)
+        self.assertContains(response, "You are about to delete")
+
+        # submit to delete it
+        response = self.assertDeleteSubmit(delete_url, object_deactivated=self.ex_channel, success_status=200)
+        self.assertEqual("/org/home/", response["Temba-Success"])
+
+        # reactivate
+        self.ex_channel.is_active = True
+        self.ex_channel.save()
+
+        # add a dependency and try again
+        flow = self.create_flow("Color Flow")
+        flow.channel_dependencies.add(self.ex_channel)
+        self.assertFalse(flow.has_issues)
+
+        response = self.assertDeleteFetch(delete_url, allow_editors=True)
+        self.assertContains(response, "is used by the following items but can still be deleted:")
+        self.assertContains(response, "Color Flow")
+
+        self.assertDeleteSubmit(delete_url, object_deactivated=self.ex_channel, success_status=200)
+
+        flow.refresh_from_db()
+        self.assertTrue(flow.has_issues)
+        self.assertNotIn(self.ex_channel, flow.channel_dependencies.all())
+
+    def test_delete_delegate(self):
+        self.org.connect_vonage("key", "secret", self.admin)
+        android = Channel.create(
+            self.org, self.admin, "RW", "A", name="Android", address="+250785551313", role="SR", schemes=("tel",)
+        )
+        vonage = Channel.add_vonage_bulk_sender(self.admin, android)
+
+        delete_url = reverse("channels.channel_delete", args=[vonage.uuid])
+
+        # fetch delete modal
+        response = self.assertDeleteFetch(delete_url, allow_editors=True)
+        self.assertContains(response, "Disable Bulk Sending")
+
+        # try when delegate is a caller instead
+        vonage.role = "C"
+        vonage.save(update_fields=("role",))
+
+        # fetch delete modal
+        response = self.assertDeleteFetch(delete_url, allow_editors=True)
+        self.assertContains(response, "Disable Voice Calling")
+
+        # submit to delete it - should be redirected to the Android channel page
+        response = self.assertDeleteSubmit(delete_url, object_deactivated=vonage, success_status=200)
+        self.assertEqual(f"/channels/channel/read/{android.uuid}/", response["Temba-Success"])
 
 
 class ChannelEventCRUDLTest(TembaTest):
     def test_calls(self):
-        now = timezone.now()
-        ChannelEvent.create(self.channel, "tel:12345", ChannelEvent.TYPE_CALL_IN, now, dict(duration=600))
-        ChannelEvent.create(self.channel, "tel:890", ChannelEvent.TYPE_CALL_IN_MISSED, now)
-        ChannelEvent.create(self.channel, "tel:456767", ChannelEvent.TYPE_UNKNOWN, now)
+        self.create_channel_event(self.channel, "tel:12345", ChannelEvent.TYPE_CALL_IN, extra=dict(duration=600))
+        self.create_channel_event(self.channel, "tel:890", ChannelEvent.TYPE_CALL_IN_MISSED)
+        self.create_channel_event(self.channel, "tel:456767", ChannelEvent.TYPE_UNKNOWN)
 
         list_url = reverse("channels.channelevent_calls")
 
@@ -2189,7 +1593,8 @@ class SyncEventTest(SmartminTest):
             config={Channel.CONFIG_FCM_ID: "123"},
         )
 
-    def test_sync_event_model(self):
+    @mock_mailroom
+    def test_sync_event_model(self, mr_mocks):
         self.sync_event = SyncEvent.create(
             self.tel_channel,
             dict(p_src="AC", p_sts="DIS", p_lvl=80, net="WIFI", pending=[1, 2], retry=[3, 4], cc="RW"),
@@ -2323,7 +1728,7 @@ class ChannelClaimTest(TembaTest):
 
     @override_settings(SEND_EMAILS=True)
     def test_sms_alert(self):
-        contact = self.create_contact("John Doe", "123")
+        contact = self.create_contact("John Doe", phone="123")
 
         # create a message from two hours ago
         one_hour_ago = timezone.now() - timedelta(hours=1)
@@ -2333,7 +1738,7 @@ class ChannelClaimTest(TembaTest):
         five_hours_ago = timezone.now() - timedelta(hours=5)
         six_hours_ago = timezone.now() - timedelta(hours=6)
 
-        msg1 = self.create_msg(text="Message One", contact=contact, created_on=five_hours_ago, status="Q")
+        msg1 = self.create_outgoing_msg(contact, "Message One", created_on=five_hours_ago, status="Q")
 
         # make sure our channel has been seen recently
         self.channel.last_seen = timezone.now()
@@ -2358,11 +1763,11 @@ class ChannelClaimTest(TembaTest):
         alert.ended_on = six_hours_ago
         alert.save()
 
-        dany = self.create_contact("Dany Craig", "765")
+        dany = self.create_contact("Dany Craig", phone="765")
 
         # let have a recent sent message
-        sent_msg = self.create_msg(
-            text="SENT Message", contact=dany, created_on=four_hours_ago, sent_on=one_hour_ago, status="D"
+        sent_msg = self.create_outgoing_msg(
+            dany, "SENT Message", created_on=four_hours_ago, sent_on=one_hour_ago, status="D"
         )
 
         # ok check on our channel
@@ -2376,7 +1781,7 @@ class ChannelClaimTest(TembaTest):
         sent_msg.save()
 
         msg1.delete()
-        msg1 = self.create_msg(text="Message One", contact=contact, created_on=two_hours_ago, status="Q")
+        msg1 = self.create_outgoing_msg(contact, "Message One", created_on=two_hours_ago, status="Q")
 
         # check our channel again
         check_channels_task()
@@ -2404,16 +1809,27 @@ class ChannelClaimTest(TembaTest):
         self.assertFalse(alert.ended_on)
         self.assertTrue(len(mail.outbox) == 2)
 
-        # run again, nothing should change
-        check_channels_task()
+        # create another open SMS alert
+        Alert.objects.create(
+            channel=self.channel,
+            alert_type=Alert.TYPE_SMS,
+            created_on=timezone.now(),
+            created_by=self.admin,
+            modified_on=timezone.now(),
+            modified_by=self.admin,
+        )
 
-        alert = Alert.objects.get(ended_on=None)
-        self.assertFalse(alert.ended_on)
+        # run again, nothing should change
+        with self.assertNumQueries(9):
+            check_channels_task()
+
+        self.assertEqual(2, Alert.objects.filter(channel=self.channel, ended_on=None).count())
         self.assertTrue(len(mail.outbox) == 2)
 
         # fix our message
         msg1.status = "D"
-        msg1.save()
+        msg1.sent_on = timezone.now()
+        msg1.save(update_fields=("status", "sent_on"))
 
         # run again, our alert should end
         check_channels_task()
@@ -2430,26 +1846,24 @@ class ChannelCountTest(TembaTest):
         self.assertEqual(assert_count, calculated_count)
 
     def test_daily_counts(self):
-        # test that messages to test contacts aren't counted
         self.admin.set_org(self.org)
-        test_contact = Contact.get_test_contact(self.admin)
-        Msg.create_outgoing(self.org, self.admin, test_contact, "Test Message", channel=self.channel)
 
         # no channel counts
         self.assertFalse(ChannelCount.objects.all())
 
-        # real contact, but no channel
-        Msg.create_incoming(None, "tel:+250788111222", "Test Message", org=self.org)
+        # contact without a channel
+        contact = self.create_contact("Joe", phone="+250788111222")
+        self.create_incoming_msg(contact, "Test Message", surveyor=True)
 
         # still no channel counts
         self.assertFalse(ChannelCount.objects.all())
 
         # incoming msg with a channel
-        msg = Msg.create_incoming(self.channel, "tel:+250788111222", "Test Message", org=self.org)
+        msg = self.create_incoming_msg(contact, "Test Message")
         self.assertDailyCount(self.channel, 1, ChannelCount.INCOMING_MSG_TYPE, msg.created_on.date())
 
         # insert another
-        msg = Msg.create_incoming(self.channel, "tel:+250788111222", "Test Message", org=self.org)
+        msg = self.create_incoming_msg(contact, "Test Message")
         self.assertDailyCount(self.channel, 2, ChannelCount.INCOMING_MSG_TYPE, msg.created_on.date())
 
         # squash our counts
@@ -2468,8 +1882,7 @@ class ChannelCountTest(TembaTest):
         ChannelCount.objects.all().delete()
 
         # ok, test outgoing now
-        real_contact, urn_obj = Contact.get_or_create(self.org, "tel:+250788111222", user=self.admin)
-        msg = Msg.create_outgoing(self.org, self.admin, real_contact, "Real Message", channel=self.channel)
+        msg = self.create_outgoing_msg(contact, "Real Message", channel=self.channel)
         log = ChannelLog.objects.create(channel=self.channel, msg=msg, description="Unable to send", is_error=True)
 
         # squash our counts
@@ -2490,7 +1903,7 @@ class ChannelCountTest(TembaTest):
         ChannelCount.objects.all().delete()
 
         # incoming IVR
-        msg = Msg.create_incoming(self.channel, "tel:+250788111222", "Test Message", org=self.org, msg_type=IVR)
+        msg = self.create_incoming_msg(contact, "Test Message", msg_type=Msg.TYPE_IVR)
         self.assertDailyCount(self.channel, 1, ChannelCount.INCOMING_IVR_TYPE, msg.created_on.date())
         msg.release()
         self.assertDailyCount(self.channel, 1, ChannelCount.INCOMING_IVR_TYPE, msg.created_on.date())
@@ -2498,25 +1911,45 @@ class ChannelCountTest(TembaTest):
         ChannelCount.objects.all().delete()
 
         # outgoing ivr
-        msg = Msg.create_outgoing(self.org, self.admin, real_contact, "Real Voice", channel=self.channel, msg_type=IVR)
+        msg = self.create_outgoing_msg(contact, "Real Voice", msg_type=Msg.TYPE_IVR)
         self.assertDailyCount(self.channel, 1, ChannelCount.OUTGOING_IVR_TYPE, msg.created_on.date())
         msg.release()
         self.assertDailyCount(self.channel, 1, ChannelCount.OUTGOING_IVR_TYPE, msg.created_on.date())
 
+        with patch("temba.channels.tasks.track") as mock:
+            self.create_incoming_msg(contact, "Test Message")
+
+            with self.assertNumQueries(6):
+                track_org_channel_counts(now=timezone.now() + timedelta(days=1))
+                self.assertEqual(2, mock.call_count)
+                mock.assert_called_with(self.admin, "temba.ivr_outgoing", {"count": 1})
+
 
 class ChannelLogTest(TembaTest):
-    def test_channellog_views(self):
-        self.contact = self.create_contact("Fred Jones", "+12067799191")
-        self.create_secondary_org(100000)
+    def test_views(self):
+        self.channel.role = "CASR"
+        self.channel.save(update_fields=("role",))
 
-        incoming_msg = Msg.create_incoming(self.channel, "tel:+12067799191", "incoming msg", contact=self.contact)
-        self.assertEqual(self.contact, incoming_msg.contact)
+        other_org_channel = Channel.create(
+            self.org2,
+            self.admin2,
+            "RW",
+            "EX",
+            name="Other Channel",
+            address="+250785551414",
+            role="SR",
+            secret="45473",
+            schemes=("tel",),
+            config={"send_url": "http://send.com"},
+        )
 
-        success_msg = Msg.create_outgoing(self.org, self.admin, self.contact, "success message", channel=self.channel)
-        success_msg.status_delivered()
+        contact = self.create_contact("Fred Jones", phone="+12067799191")
 
-        self.assertIsNotNone(success_msg.sent_on)
+        # create unrelated incoming message
+        self.create_incoming_msg(contact, "incoming msg")
 
+        # create sent outgoing message with success channel log
+        success_msg = self.create_outgoing_msg(contact, "success message", status="D")
         success_log = ChannelLog.objects.create(
             channel=self.channel, msg=success_msg, description="Successfully Sent", is_error=False
         )
@@ -2524,15 +1957,33 @@ class ChannelLogTest(TembaTest):
         success_log.request = "POST https://foo.bar/send?msg=failed+message"
         success_log.save(update_fields=["request", "response"])
 
-        failed_msg = Msg.create_outgoing(self.org, self.admin, self.contact, "failed message", channel=self.channel)
+        # create failed outgoing message with error channel log
+        failed_msg = self.create_outgoing_msg(contact, "failed message")
         failed_log = ChannelLog.log_error(dict_to_struct("MockMsg", failed_msg.as_task_json()), "Error Sending")
 
         failed_log.response = json.dumps(dict(error="invalid credentials"))
         failed_log.request = "POST https://foo.bar/send?msg=failed+message"
         failed_log.save(update_fields=["request", "response"])
 
+        # create call with an interaction log
+        ivr_flow = self.get_flow("ivr")
+        call = self.create_incoming_call(ivr_flow, contact)
+
+        # create failed call with an interaction log
+        self.create_incoming_call(ivr_flow, contact, status=IVRCall.STATUS_FAILED)
+
+        # create log for other org
+        other_org_contact = self.create_contact("Hans", phone="+593979123456")
+        other_org_msg = self.create_outgoing_msg(other_org_contact, "hi", status="D")
+        other_org_log = ChannelLog.objects.create(
+            channel=other_org_channel, msg=other_org_msg, description="Successfully Sent", is_error=False
+        )
+        other_org_log.response = ""
+        other_org_log.request = "POST https://foo.bar/send?msg=failed+message"
+        other_org_log.save(update_fields=["request", "response"])
+
         # can't see the view without logging in
-        list_url = reverse("channels.channellog_list") + "?channel=%d" % self.channel.id
+        list_url = reverse("channels.channellog_list", args=[self.channel.uuid])
         response = self.client.get(list_url)
         self.assertLoginRedirect(response)
 
@@ -2543,7 +1994,7 @@ class ChannelLogTest(TembaTest):
         # same if logged in as other admin
         self.login(self.admin2)
 
-        list_url = reverse("channels.channellog_list") + "?channel=%d" % self.channel.id
+        list_url = reverse("channels.channellog_list", args=[self.channel.uuid])
         response = self.client.get(list_url)
         self.assertLoginRedirect(response)
 
@@ -2554,15 +2005,27 @@ class ChannelLogTest(TembaTest):
         # login as real admin
         self.login(self.admin)
 
+        response = self.client.get(reverse("channels.channellog_list", args=["invalid-uuid"]))
+        self.assertEqual(404, response.status_code)
+
         # check our list page has both our channel logs
         response = self.client.get(list_url)
         self.assertContains(response, "Successfully Sent")
+        self.assertContains(response, "Error Sending")
+
+        # check error logs only
+        response = self.client.get(list_url + "?errors=1")
+        self.assertNotContains(response, "Successfully Sent")
         self.assertContains(response, "Error Sending")
 
         # view failed alone
         response = self.client.get(read_url)
         self.assertContains(response, "failed+message")
         self.assertContains(response, "invalid credentials")
+
+        # can't view log from other org
+        response = self.client.get(reverse("channels.channellog_read", args=[other_org_log.id]))
+        self.assertLoginRedirect(response)
 
         # disconnect our msg
         failed_log.msg = None
@@ -2575,351 +2038,639 @@ class ChannelLogTest(TembaTest):
         response = self.client.get(reverse("channels.channellog_read", args=[success_log.id]))
         self.assertContains(response, "Successfully Sent")
 
-        self.assertEqual(1, self.channel.get_success_log_count())
-        self.assertEqual(1, self.channel.get_error_log_count())
+        self.assertEqual(self.channel.get_success_log_count(), 2)
+        self.assertEqual(self.channel.get_error_log_count(), 4)  # error log count always includes IVR logs
 
-        # change our org to anonymous
-        self.org.is_anon = True
-        self.org.save()
+        # check that IVR logs are displayed correctly
+        response = self.client.get(reverse("channels.channellog_list", args=[self.channel.uuid]) + "?connections=1")
+        self.assertContains(response, "15 seconds")
+        self.assertContains(response, "2 results")
 
-        # should no longer be able to see read page
+        # make sure we can see the details of the IVR log
+        response = self.client.get(reverse("channels.channellog_connection", args=[call.id]))
+        self.assertContains(response, "{&quot;say&quot;: &quot;Hello&quot;}")
+
+        # if duration isn't set explicitly, it can be calculated
+        call.started_on = datetime(2019, 8, 12, 11, 4, 0, 0, timezone.utc)
+        call.status = IVRCall.STATUS_IN_PROGRESS
+        call.duration = None
+        call.save(update_fields=("started_on", "status", "duration"))
+
+        with patch("django.utils.timezone.now", return_value=datetime(2019, 8, 12, 11, 4, 30, 0, timezone.utc)):
+            response = self.client.get(
+                reverse("channels.channellog_list", args=[self.channel.uuid]) + "?connections=1"
+            )
+            self.assertContains(response, "30 seconds")
+
+    def test_channellog_connection_anonymous(self):
+        url = reverse("channels.channellog_connection", args=(1,))
+
+        self.login(self.admin)
+        response = self.client.get(url)
+
+        self.assertTrue(response.status_code, 200)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(url)
+            # admin has no access
+            self.assertLoginRedirect(response)
+
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(url)
+            # customer_support has access
+            self.assertTrue(response.status_code, 200)
+
+    def test_redaction_for_telegram(self):
+        urn = "telegram:3527065"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("TG", "Test TG Channel", "234567")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
+
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url=r"https://api.telegram.org/65474/sendMessage",
+            method="POST",
+            request="POST /65474/sendMessage HTTP/1.1\r\nHost: api.telegram.org\r\nUser-Agent: Courier/1.2.159\r\nContent-Length: 231\r\nContent-Type: application/x-www-form-urlencoded\r\nAccept-Encoding: gzip\r\n\r\nchat_id=3527065&reply_markup=%7B%22resize_keyboard%22%3Atrue%2C%22one_time_keyboard%22%3Atrue%2C%22keyboard%22%3A%5B%5B%7B%22text%22%3A%22blackjack%22%7D%2C%7B%22text%22%3A%22balance%22%7D%5D%5D%7D&text=Your+balance+is+now+%246.00.",
+            response='HTTP/1.1 200 OK\r\nContent-Length: 298\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: Content-Length,Content-Type,Date,Server,Connection\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nDate: Tue, 11 Jun 2019 15:33:06 GMT\r\nServer: nginx/1.12.2\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains; preload\r\n\r\n{"ok":true,"result":{"message_id":1440,"from":{"id":678777066,"is_bot":true,"first_name":"textit_staging","username":"textit_staging_bot"},"chat":{"id":3527065,"first_name":"Nic","last_name":"Pottier","username":"Nicpottier","type":"private"},"date":1560267186,"text":"Your balance is now $6.00."}}',
+            response_status=200,
+        )
+
+        self.login(self.admin)
+
+        list_url = reverse("channels.channellog_list", args=[channel.uuid])
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+
+        # check list page shows un-redacted content for a regular org
+        response = self.client.get(list_url)
+
+        self.assertContains(response, "3527065", count=1)
+
+        # check list page shows redacted content for an anon org
+        with AnonymousOrg(self.org):
+            response = self.client.get(list_url)
+
+            self.assertContains(response, "3527065", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+        # check read page shows un-redacted content for a regular org
         response = self.client.get(read_url)
-        self.assertLoginRedirect(response)
 
-        # but if our admin is a superuser they can
-        self.admin.is_superuser = True
-        self.admin.save()
+        self.assertContains(response, "3527065", count=3)
+        self.assertContains(response, "Nic", count=2)
+        self.assertContains(response, "Pottier", count=1)
+
+        # check read page shows redacted content for an anon org
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            self.assertContains(response, "3527065", count=0)
+            self.assertContains(response, "Nic", count=0)
+            self.assertContains(response, "Pottier", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=9)
+
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "3527065", count=3)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            # contact_urn is still masked on the read page, it uses contacts.models.Contact.get_display
+            # Contact.get_display does not check if user has `contacts.contact_break_anon` permission
+            self.assertContains(response, "3527065", count=2)
+            self.assertContains(response, "Nic", count=2)
+            self.assertContains(response, "Pottier", count=1)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+    def test_redaction_for_telegram_with_invalid_json(self):
+        urn = "telegram:3527065"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("TG", "Test TG Channel", "234567")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
+
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url=r"not important",
+            method="POST",
+            request=r"not important",
+            response='Content-Type: application/json\r\n\r\n{"bad_json":true, "first_name": "Nic"',
+            response_status=200,
+        )
+
+        self.login(self.admin)
+
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "3527065", count=1)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            self.assertContains(response, "3527065", count=0)
+            self.assertContains(response, "Nic", count=0)
+            self.assertContains(response, "Pottier", count=0)
+
+            # everything is masked
+            self.assertContains(response, ContactURN.ANON_MASK, count=4)
+
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "3527065", count=1)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            self.assertContains(response, "Nic", count=1)
+
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+    def test_redaction_for_telegram_when_no_match(self):
+        urn = "telegram:3527065"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("TG", "Test TG Channel", "234567")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
+
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url="There is no contact identifying information",
+            method="POST",
+            request='There is no contact identifying information\r\n\r\n{"json": "ok"}',
+            response='There is no contact identifying information\r\n\r\n{"json": "ok"}',
+            response_status=200,
+        )
+
+        self.login(self.admin)
+
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "3527065", count=1)
+        self.assertContains(response, "There is no contact identifying information", count=3)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            # url/request/reponse are masked
+            self.assertContains(response, "There is no contact identifying information", count=0)
+
+            self.assertContains(response, "3527065", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=4)
+
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
 
         response = self.client.get(read_url)
-        self.assertContains(response, "invalid credentials")
 
+        self.assertContains(response, "3527065", count=1)
 
-class JunebugTestMixin(object):
-    def mk_event(self, **kwargs):
-        default = {"event_type": "submitted", "message_id": "message-id", "timestamp": "2017-01-01 00:00:00+0000"}
-        default.update(kwargs)
-        return default
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            self.assertContains(response, "There is no contact identifying information", count=3)
 
-    def mk_ussd_msg(self, session_event="new", session_id=None, **kwargs):
-        return self.mk_msg(channel_data={"session_event": session_event, "session_id": session_id}, **kwargs)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
 
-    def mk_msg(self, **kwargs):
-        default = {
-            "channel_data": {},
-            "from": "+27123456789",
-            "channel_id": "channel-id",
-            "timestamp": "2017-01-01 00:00:00.00",
-            "content": "content",
-            "to": "to-addr",
-            "reply_to": None,
-            "message_id": "message-id",
-        }
-        default.update(kwargs)
-        return default
+    def test_redaction_for_twitter(self):
+        urn = "twitterid:767659860"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("TWT", "Test TWT Channel", "nyaruka")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
 
-
-class JunebugTest(JunebugTestMixin, TembaTest):
-    def setUp(self):
-        super().setUp()
-
-        self.channel.delete()
-
-        self.channel = Channel.create(
-            self.org,
-            self.user,
-            "RW",
-            "JNU",
-            None,
-            "1234",
-            config=dict(username="junebug-user", password="junebug-pass", send_url="http://example.org/"),
-            uuid="00000000-0000-0000-0000-000000001234",
-            role=Channel.DEFAULT_ROLE,
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url=r"https://textit.in/c/twt/5c70a767-f3dc-4a99-9323-4774f6432af5/receive",
+            method="POST",
+            request='POST /c/twt/5c70a767-f3dc-4a99-9323-4774f6432af5/receive HTTP/1.1\r\nHost: textit.in\r\nContent-Length: 1596\r\nContent-Type: application/json\r\nFinagle-Ctx-Com.twitter.finagle.deadline: 1560853608671000000 1560853611615000000\r\nFinagle-Ctx-Com.twitter.finagle.retries: 0\r\nFinagle-Http-Retryable-Request: \r\nX-Amzn-Trace-Id: Root=1-5d08bc68-de52174e83904d614a32a5c6\r\nX-B3-Flags: 2\r\nX-B3-Parentspanid: fe22fff79af84311\r\nX-B3-Sampled: false\r\nX-B3-Spanid: 86f3c3871ae31c2d\r\nX-B3-Traceid: fe22fff79af84311\r\nX-Forwarded-For: 199.16.157.173\r\nX-Forwarded-Port: 443\r\nX-Forwarded-Proto: https\r\nX-Twitter-Webhooks-Signature: sha256=CYVI5q7e7bzKufCD3GnZoJheSmjVRmNQo9uzO/gi4tA=\r\n\r\n{"for_user_id":"3753944237","direct_message_events":[{"type":"message_create","id":"1140928844112814089","created_timestamp":"1560853608526","message_create":{"target":{"recipient_id":"3753944237"},"sender_id":"767659860","message_data":{"text":"Briefly what will you be talking about and do you have any feature stories","entities":{"hashtags":[],"symbols":[],"user_mentions":[],"urls":[]}}}}],"users":{"767659860":{"id":"767659860","created_timestamp":"1345386861000","name":"Aaron Tumukunde","screen_name":"tumaaron","description":"Mathematics \u25a1 Media \u25a1 Real Estate \u25a1 And Jesus above all.","protected":false,"verified":false,"followers_count":167,"friends_count":485,"statuses_count":237,"profile_image_url":"http://pbs.twimg.com/profile_images/860380640029573120/HKuXgxR__normal.jpg","profile_image_url_https":"https://pbs.twimg.com/profile_images/860380640029573120/HKuXgxR__normal.jpg"},"3753944237":{"id":"3753944237","created_timestamp":"1443048916258","name":"Teheca","screen_name":"tehecaug","location":"Uganda","description":"We connect new mothers & parents to nurses for postnatal care. #Google LaunchPad Africa 2018, #UNFPA UpAccelerate 2017 #MasterCard Innovation exp 2017 #YCSUS18","url":"https://t.co/i0hcLRwEj7","protected":false,"verified":false,"followers_count":3369,"friends_count":4872,"statuses_count":1128,"profile_image_url":"http://pbs.twimg.com/profile_images/694638274204143616/Q4Mbg1tO_normal.png","profile_image_url_https":"https://pbs.twimg.com/profile_images/694638274204143616/Q4Mbg1tO_normal.png"}}}',
+            response='HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\n{"message":"Message Accepted","data":[{"type":"msg","channel_uuid":"5c70a767-f3dc-4a99-9323-4774f6432af5","msg_uuid":"6c26277d-7002-4489-9b7f-998d4be5d0db","text":"Briefly what will you be talking about and do you have any feature stories","urn":"twitterid:767659860#tumaaron","external_id":"1140928844112814089","received_on":"2019-06-18T10:26:48.526Z"}]}',
+            response_status=200,
         )
 
-    def tearDown(self):
-        super().tearDown()
+        self.login(self.admin)
 
-    def test_get_request(self):
-        response = self.client.get(reverse("handlers.junebug_handler", args=["event", self.channel.uuid]))
-        self.assertEqual(response.status_code, 400)
+        list_url = reverse("channels.channellog_list", args=[channel.uuid])
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
 
-    def test_status_with_invalid_event(self):
-        delivery_url = reverse("handlers.junebug_handler", args=["event", self.channel.uuid])
-        response = self.client.post(delivery_url, data=json.dumps({}), content_type="application/json")
-        self.assertContains(response, "Missing one of", status_code=400)
+        response = self.client.get(list_url)
 
-    def test_status(self):
-        # ok, what happens with an invalid uuid?
-        data = self.mk_event()
-        response = self.client.post(
-            reverse("handlers.junebug_handler", args=["event", "not-real-uuid"]),
-            data=json.dumps(data),
-            content_type="application/json",
-        )
-        self.assertEqual(400, response.status_code)
+        self.assertContains(response, "767659860", count=1)
 
-        # ok, try with a valid uuid, but invalid message id -1
-        delivery_url = reverse("handlers.junebug_handler", args=["event", self.channel.uuid])
-        response = self.client.post(delivery_url, data=json.dumps(data), content_type="application/json")
-        self.assertEqual(400, response.status_code)
+        with AnonymousOrg(self.org):
+            response = self.client.get(list_url)
 
-        # ok, lets create an outgoing message to update
-        joe = self.create_contact("Joe Biden", "+254788383383")
-        msg = joe.send("Hey Joe, it's Obama, pick up!", self.admin)[0]
-        msg.external_id = data["message_id"]
-        msg.save(update_fields=("external_id",))
+            self.assertContains(response, "767659860", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
 
-        # data['id'] = msg.external_id
+        response = self.client.get(read_url)
 
-        def assertStatus(sms, event_type, assert_status):
-            data["event_type"] = event_type
-            response = self.client.post(
-                reverse("handlers.junebug_handler", args=["event", self.channel.uuid]),
-                data=json.dumps(data),
-                content_type="application/json",
-            )
-            self.assertEqual(200, response.status_code)
-            sms = Msg.objects.get(pk=sms.id)
-            self.assertEqual(assert_status, sms.status)
+        self.assertContains(response, "767659860", count=5)
+        self.assertContains(response, "Aaron Tumukunde", count=1)
+        self.assertContains(response, "tumaaron", count=2)
 
-        assertStatus(msg, "submitted", SENT)
-        assertStatus(msg, "delivery_succeeded", DELIVERED)
-        assertStatus(msg, "delivery_failed", FAILED)
-        assertStatus(msg, "rejected", FAILED)
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
 
-    def test_status_invalid_message_id(self):
-        # ok, what happens with an invalid uuid?
-        data = self.mk_event()
-        response = self.client.post(
-            reverse("handlers.junebug_handler", args=["event", self.channel.uuid]),
-            data=json.dumps(data),
-            content_type="application/json",
-        )
-        self.assertContains(
-            response, "Message with external id of '%s' not found" % (data["message_id"],), status_code=400
-        )
+            self.assertContains(response, "767659860", count=0)
+            self.assertContains(response, "Aaron Tumukunde", count=0)
+            self.assertContains(response, "tumaaron", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=14)
 
-    def test_status_with_auth(self):
-        config = self.channel.config
-        config[Channel.CONFIG_SECRET] = "UjOq8ATo2PDS6L08t6vlqSoK"
-        self.channel.config = config
-        self.channel.save(update_fields=["config"])
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
 
-        data = self.mk_event()
-        joe = self.create_contact("Joe Biden", "+254788383383")
-        msg = joe.send("Hey Joe, it's Obama, pick up!", self.admin)[0]
-        msg.external_id = data["message_id"]
-        msg.save(update_fields=("external_id",))
+        self.login(self.customer_support)
 
-        def assertStatus(sms, event_type, assert_status):
-            data["event_type"] = event_type
-            response = self.client.post(
-                reverse("handlers.junebug_handler", args=["event", self.channel.uuid]),
-                data=json.dumps(data),
-                content_type="application/json",
-                HTTP_AUTHORIZATION="Token UjOq8ATo2PDS6L08t6vlqSoK",
-            )
-            self.assertEqual(200, response.status_code)
-            sms = Msg.objects.get(pk=sms.id)
-            self.assertEqual(assert_status, sms.status)
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
 
-        assertStatus(msg, "submitted", SENT)
-        assertStatus(msg, "delivery_succeeded", DELIVERED)
-        assertStatus(msg, "delivery_failed", FAILED)
-        assertStatus(msg, "rejected", FAILED)
+        self.assertContains(response, "767659860", count=5)
 
-    def test_status_incorrect_auth(self):
-        config = self.channel.config
-        config[Channel.CONFIG_SECRET] = "UjOq8ATo2PDS6L08t6vlqSoK"
-        self.channel.config = config
-        self.channel.save(update_fields=["config"])
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            # contact_urn is still masked on the read page, it uses contacts.models.Contact.get_display
+            # Contact.get_display does not check if user has `contacts.contact_break_anon` permission
+            self.assertContains(response, "767659860", count=4)
+            self.assertContains(response, "Aaron Tumukunde", count=1)
+            self.assertContains(response, "tumaaron", count=2)
 
-        # ok, what happens with an invalid uuid?
-        data = self.mk_event()
-        response = self.client.post(
-            reverse("handlers.junebug_handler", args=["event", self.channel.uuid]),
-            data=json.dumps(data),
-            content_type="application/json",
-            HTTP_AUTHORIZATION="Token Not_token",
-        )
-        self.assertEqual(401, response.status_code)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
 
-    def test_receive_with_invalid_message(self):
-        callback_url = reverse("handlers.junebug_handler", args=["inbound", self.channel.uuid])
-        response = self.client.post(callback_url, json.dumps({}), content_type="application/json")
-        self.assertContains(response, "Missing one of", status_code=400)
+    def test_redaction_for_twitter_when_no_match(self):
+        urn = "twitterid:767659860"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("TWT", "Test TWT Channel", "nyaruka")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
 
-    def test_receive(self):
-        data = self.mk_msg(content="événement")
-        callback_url = reverse("handlers.junebug_handler", args=["inbound", self.channel.uuid])
-        response = self.client.post(callback_url, json.dumps(data), content_type="application/json")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "ack")
-
-        # load our message
-        msg = Msg.objects.get()
-        self.assertEqual(data["from"], msg.contact.get_urn(TEL_SCHEME).path)
-        self.assertEqual(INCOMING, msg.direction)
-        self.assertEqual(self.org, msg.org)
-        self.assertEqual(self.channel, msg.channel)
-        self.assertEqual("événement", msg.text)
-
-    def test_receive_with_auth(self):
-        config = self.channel.config
-        config[Channel.CONFIG_SECRET] = "UjOq8ATo2PDS6L08t6vlqSoK"
-        self.channel.config = config
-        self.channel.save(update_fields=["config"])
-
-        data = self.mk_msg(content="événement")
-        callback_url = reverse("handlers.junebug_handler", args=["inbound", self.channel.uuid])
-        response = self.client.post(
-            callback_url,
-            json.dumps(data),
-            content_type="application/json",
-            HTTP_AUTHORIZATION="Token UjOq8ATo2PDS6L08t6vlqSoK",
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url="There is no contact identifying information",
+            method="POST",
+            request=r"""There is no contact identifying information\r\n\r\n{"json": "ok"}""",
+            response=r"""There is no contact identifying information\r\n\r\n{"json": "ok"}""",
+            response_status=200,
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "ack")
+        self.login(self.admin)
 
-        # load our message
-        msg = Msg.objects.get()
-        self.assertEqual(data["from"], msg.contact.get_urn(TEL_SCHEME).path)
-        self.assertEqual(INCOMING, msg.direction)
-        self.assertEqual(self.org, msg.org)
-        self.assertEqual(self.channel, msg.channel)
-        self.assertEqual("événement", msg.text)
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
 
-    def test_receive_with_incorrect_auth(self):
-        config = self.channel.config
-        config[Channel.CONFIG_SECRET] = "UjOq8ATo2PDS6L08t6vlqSoK"
-        self.channel.config = config
-        self.channel.save(update_fields=["config"])
+        self.assertContains(response, "767659860", count=1)
+        self.assertContains(response, "There is no contact identifying information", count=3)
 
-        data = self.mk_msg(content="événement")
-        callback_url = reverse("handlers.junebug_handler", args=["inbound", self.channel.uuid])
-        response = self.client.post(
-            callback_url, json.dumps(data), content_type="application/json", HTTP_AUTHORIZATION="Token Not_token"
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            # url/request/reponse are masked
+            self.assertContains(response, "There is no contact identifying information", count=0)
+
+            self.assertContains(response, "767659860", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=4)
+
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "767659860", count=1)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            self.assertContains(response, "There is no contact identifying information", count=3)
+
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+    def test_redaction_for_facebook(self):
+        urn = "facebook:2150393045080607"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("FB", "Test FB Channel", "54764868534")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
+
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url=f"https://textit.in/c/fb/{channel.uuid}/receive",
+            method="POST",
+            request="""POST /c/fb/d1117754-f2ab-4348-9572-996ddc1959a8/receive HTTP/1.1\r\nHost: textit.in\r\nAccept: */*\r\nAccept-Encoding: deflate, gzip\r\nContent-Length: 314\r\nContent-Type: application/json\r\n\r\n{"object":"page","entry":[{"id":"311494332880244","time":1559102364444,"messaging":[{"sender":{"id":"2150393045080607"},"recipient":{"id":"311494332880244"},"timestamp":1559102363925,"message":{"mid":"ld5jgfQP8TLBX9FFc3AETshZgE6Zn5UjpY3vY00t3A_YYC2AYDM3quxaodTiHj7nK6lI_ds4WFUJlTmM2l5xoA","seq":0,"text":"hi"}}]}]}""",
+            response="""HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\n\r\n{"message":"Events Handled","data":[{"type":"msg","channel_uuid":"d1117754-f2ab-4348-9572-996ddc1959a8","msg_uuid":"55a3387b-f97e-4270-8157-7ba781a86411","text":"hi","urn":"facebook:2150393045080607","external_id":"ld5jgfQP8TLBX9FFc3AETshZgE6Zn5UjpY3vY00t3A_YYC2AYDM3quxaodTiHj7nK6lI_ds4WFUJlTmM2l5xoA","received_on":"2019-05-29T03:59:23.925Z"}]}""",
+            response_status=200,
         )
 
-        self.assertEqual(response.status_code, 401)
+        self.login(self.admin)
 
-    @override_settings(SEND_MESSAGES=True)
-    def test_send_wired(self):
-        joe = self.create_contact("Joe", "+250788383383")
-        msg = joe.send("événement", self.admin, trigger_send=False)[0]
+        list_url = reverse("channels.channellog_list", args=[channel.uuid])
+        response = self.client.get(list_url)
 
-        with patch("requests.post") as mock:
-            mock.return_value = MockResponse(
-                200, json.dumps({"result": {"message_id": "07033084-5cfd-4812-90a4-e4d24ffb6e3d"}})
-            )
+        self.assertContains(response, "2150393045080607", count=1)
+        self.assertContains(response, "facebook:2150393045080607", count=0)
 
-            # manually send it off
-            Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
+        with AnonymousOrg(self.org):
+            response = self.client.get(list_url)
 
-            # check the status of the message is now sent
-            msg.refresh_from_db()
-            self.assertEqual(msg.status, WIRED)
-            self.assertTrue(msg.sent_on)
-            self.assertEqual(msg.external_id, "07033084-5cfd-4812-90a4-e4d24ffb6e3d")
+            self.assertContains(response, "2150393045080607", count=0)
+            self.assertContains(response, "facebook:2150393045080607", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
 
-            self.clear_cache()
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
 
-            self.assertEqual(mock.call_args[1]["json"]["content"], "événement")
+        response = self.client.get(read_url)
 
-    @override_settings(SEND_MESSAGES=True)
-    def test_send_media(self):
-        joe = self.create_contact("Joe", "+250788383383")
-        msg = joe.send(
-            "MT", self.admin, trigger_send=False, attachments=["image/jpeg:https://example.com/attachments/pic.jpg"]
-        )[0]
+        self.assertContains(response, "2150393045080607", count=3)
+        self.assertContains(response, "facebook:2150393045080607", count=1)
 
-        with patch("requests.post") as mock:
-            mock.return_value = MockResponse(
-                200, json.dumps({"result": {"message_id": "07033084-5cfd-4812-90a4-e4d24ffb6e3d"}})
-            )
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
 
-            # manually send it off
-            Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
+            self.assertContains(response, "2150393045080607", count=0)
+            self.assertContains(response, "facebook:", count=1)
 
-            # check the status of the message is now sent
-            msg.refresh_from_db()
-            self.assertEqual(msg.status, WIRED)
-            self.assertTrue(msg.sent_on)
-            self.assertEqual(msg.external_id, "07033084-5cfd-4812-90a4-e4d24ffb6e3d")
+            self.assertContains(response, ContactURN.ANON_MASK, count=4)
 
-            self.clear_cache()
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
 
-            self.assertEqual(mock.call_args[1]["json"]["content"], "MT\nhttps://example.com/attachments/pic.jpg")
+        self.login(self.customer_support)
 
-    @override_settings(SEND_MESSAGES=True)
-    def test_send_errored_remote(self):
-        joe = self.create_contact("Joe", "+250788383383")
-        msg = joe.send("événement", self.admin, trigger_send=False)[0]
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
 
-        with patch("requests.post") as mock:
-            mock.return_value = MockResponse(499, "Error")
+        response = self.client.get(read_url)
 
-            # manually send it off
-            Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
+        self.assertContains(response, "2150393045080607", count=3)
+        self.assertContains(response, "facebook:2150393045080607", count=1)
 
-            # check the status of the message now errored
-            msg.refresh_from_db()
-            self.assertEqual(ERRORED, msg.status)
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            # contact_urn is still masked on the read page, it uses contacts.models.Contact.get_display
+            # Contact.get_display does not check if user has `contacts.contact_break_anon` permission
+            self.assertContains(response, "2150393045080607", count=2)
+            self.assertContains(response, "facebook:", count=1)
 
-    @override_settings(SEND_MESSAGES=True)
-    def test_send_errored_exception(self):
-        joe = self.create_contact("Joe", "+250788383383")
-        msg = joe.send("événement", self.admin, trigger_send=False)[0]
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
 
-        with patch("requests.post") as mock:
-            # force an exception
-            mock.side_effect = Exception("Kaboom!")
+    def test_redaction_for_facebook_when_no_match(self):
+        # in this case we are paranoid and mask everything
+        urn = "facebook:2150393045080607"
+        contact = self.create_contact("Fred Jones", urns=[urn])
+        channel = self.create_channel("FB", "Test FB Channel", "54764868534")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=channel)
 
-            # manually send it off
-            Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url="There is no contact identifying information",
+            method="POST",
+            request="""There is no contact identifying information""",
+            response="""There is no contact identifying information""",
+            response_status=200,
+        )
 
-            # check the status of the message now errored
-            msg.refresh_from_db()
-            self.assertEqual(ERRORED, msg.status)
+        self.login(self.admin)
 
-            self.assertFalse(
-                ChannelLog.objects.filter(
-                    description__icontains="local variable 'response' " "referenced before assignment"
-                )
-            )
+        list_url = reverse("channels.channellog_list", args=[channel.uuid])
+        response = self.client.get(list_url)
 
-    @override_settings(SEND_MESSAGES=True)
-    def test_send_deal_with_unexpected_response(self):
-        joe = self.create_contact("Joe", "+250788383383")
-        msg = joe.send("événement", self.admin, trigger_send=False)[0]
+        self.assertContains(response, "2150393045080607", count=1)
 
-        with patch("requests.post") as mock:
-            mock.return_value = MockResponse(200, json.dumps({"result": {"unexpected": "unpleasant surprise"}}))
+        with AnonymousOrg(self.org):
+            response = self.client.get(list_url)
 
-            # manually send it off
-            Channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
-            self.assertTrue(ChannelLog.objects.filter(description__icontains="Unable to read external message_id"))
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
 
-    @override_settings(SEND_MESSAGES=True)
-    def test_send_adds_auth(self):
-        config = self.channel.config
-        config[Channel.CONFIG_SECRET] = "UjOq8ATo2PDS6L08t6vlqSoK"
-        self.channel.config = config
-        self.channel.save(update_fields=["config"])
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
 
-        joe = self.create_contact("Joe", "+250788383383")
-        msg = joe.send("événement", self.admin, trigger_send=False)[0]
+        response = self.client.get(read_url)
 
-        with patch("requests.post") as mock:
-            mock.return_value = MockResponse(
-                200, json.dumps({"result": {"message_id": "07033084-5cfd-4812-90a4-e4d24ffb6e3d"}})
-            )
+        self.assertContains(response, "2150393045080607", count=1)
 
-            # manually send it off
-            self.channel.send_message(dict_to_struct("MsgStruct", msg.as_task_json()))
-            self.assertEqual(mock.call_args[1]["json"]["event_auth_token"], "UjOq8ATo2PDS6L08t6vlqSoK")
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            # url/request/reponse are masked
+            self.assertContains(response, "There is no contact identifying information", count=0)
+
+            self.assertContains(response, "2150393045080607", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=4)
+
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "2150393045080607", count=1)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            self.assertContains(response, "There is no contact identifying information", count=3)
+
+            # contact_urn is still masked on the read page, it uses contacts.models.Contact.get_display
+            # Contact.get_display does not check if user has `contacts.contact_break_anon` permission
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+    def test_redaction_for_twilio(self):
+        contact = self.create_contact("Fred Jones", phone="+593979099111")
+        channel = self.create_channel("T", "Test Twilio Channel", "+12345")
+        msg = self.create_outgoing_msg(contact, "Hi")
+
+        success_log = ChannelLog.objects.create(
+            channel=channel,
+            msg=msg,
+            description="Status Updated",
+            is_error=False,
+            url="https://textit.in/c/t/1234-5678/status?id=2466753&action=callback",
+            method="POST",
+            request="POST /c/t/1234-5678/status?id=86598533&action=callback HTTP/1.1\r\nHost: textit.in\r\nAccept: */*\r\nAccept-Encoding: gzip,deflate\r\nCache-Control: max-age=259200\r\nContent-Length: 237\r\nContent-Type: application/x-www-form-urlencoded; charset=utf-8\r\nUser-Agent: TwilioProxy/1.1\r\nX-Amzn-Trace-Id: Root=1-5d5a10b2-8c8b96c86d45a9c6bdc5f43c\r\nX-Forwarded-For: 54.210.179.19\r\nX-Forwarded-Port: 443\r\nX-Forwarded-Proto: https\r\nX-Twilio-Signature: sdgreh54hehrghssghh55=\r\n\r\nSmsSid=SM357343637&SmsStatus=delivered&MessageStatus=delivered&To=%2B593979099111&MessageSid=SM357343637&AccountSid=AC865965965&From=%2B253262278&ApiVersion=2010-04-01&ToCity=Quito&ToCountry=EC",
+            response='{"message":"Status Update Accepted","data":[{"type":"status","channel_uuid":"1234-5678","status":"D","msg_id":2466753}]}\n',
+            response_status=200,
+        )
+
+        self.login(self.admin)
+
+        list_url = reverse("channels.channellog_list", args=[channel.uuid])
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+
+        # check list page shows un-redacted content for a regular org
+        response = self.client.get(list_url)
+
+        self.assertContains(response, "097 909 9111", count=1)
+
+        # check list page shows redacted content for an anon org
+        with AnonymousOrg(self.org):
+            response = self.client.get(list_url)
+
+            self.assertContains(response, "097 909 9111", count=0)
+            self.assertContains(response, "979099111", count=0)
+            self.assertContains(response, "Quito", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+        # check read page shows un-redacted content for a regular org
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "097 909 9111", count=1)
+        self.assertContains(response, "979099111", count=1)
+        self.assertContains(response, "Quito", count=1)
+
+        # check read page shows redacted content for an anon org
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            self.assertContains(response, "097 909 9111", count=0)
+            self.assertContains(response, "979099111", count=0)
+            self.assertContains(response, "Quito", count=0)
+            self.assertContains(response, ContactURN.ANON_MASK, count=5)
+
+        # login as customer support, must see URNs
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        read_url = reverse("channels.channellog_read", args=[success_log.id])
+        response = self.client.get(read_url)
+
+        self.assertContains(response, "097 909 9111", count=1)
+        self.assertContains(response, "979099111", count=1)
+        self.assertContains(response, "Quito", count=1)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+            # contact_urn is still masked on the read page, it uses contacts.models.Contact.get_display
+            # Contact.get_display does not check if user has `contacts.contact_break_anon` permission
+            self.assertContains(response, "097 909 9111", count=0)
+            self.assertContains(response, "979099111", count=1)
+            self.assertContains(response, "Quito", count=1)
+            self.assertContains(response, ContactURN.ANON_MASK, count=1)
+
+    def test_channellog_anonymous_org_no_msg(self):
+        tw_urn = "15128505839"
+
+        tw_channel = self.create_channel("TW", "Test TW Channel", "+12345")
+
+        failed_log = ChannelLog.objects.create(
+            channel=tw_channel,
+            msg=None,
+            description="Channel Error",
+            is_error=True,
+            url=f"https://textit.in/c/tw/{tw_channel.uuid}/status?action=callback&id=58027120",
+            method="POST",
+            request="""
+POST /c/tw/8388f8cd-658f-4fae-925e-ee0792588e68/status?action=callback&id=58027120 HTTP/1.1
+Host: textit.in
+Accept: */*
+Accept-Encoding: gzip;q=1.0,deflate;q=0.6,identity;q=0.3
+Content-Length: 343
+Content-Type: application/x-www-form-urlencoded
+User-Agent: SignalwireCallback/1.0
+
+MessageSid=e1d12194-a643-4007-834a-5900db47e262&SmsSid=e1d12194-a643-4007-834a-5900db47e262&AccountSid=<redacted>&From=%2B15618981512&To=%2B15128505839&Body=Hi+Ben+Google+Voice%2C+Did+you+enjoy+your+stay+at+White+Bay+Villas%3F++Answer+with+Yes+or+No.+reply+STOP+to+opt-out.&NumMedia=0&NumSegments=1&MessageStatus=sent""",
+            response="""
+HTTP/1.1 400 Bad Request
+Content-Encoding: gzip
+Content-Type: application/json
+
+{"message":"Error","data":[{"type":"error","error":"missing request signature"}]}
+
+
+Error: missing request signature""",
+            response_status=400,
+        )
+
+        self.login(self.admin)
+
+        read_url = reverse("channels.channellog_read", args=[failed_log.id])
+
+        response = self.client.get(read_url)
+
+        # non anon user can see contact identifying data (in the request)
+        self.assertContains(response, tw_urn, count=1)
+
+        with AnonymousOrg(self.org):
+            response = self.client.get(read_url)
+
+            self.assertContains(response, tw_urn, count=0)
+
+            # when we can't identify the contact, url, request and response objects are completely masked
+            self.assertContains(response, ContactURN.ANON_MASK, count=3)
+
+    def test_trim_task(self):
+        contact = self.create_contact("Fred Jones", phone="12345")
+        msg = self.create_incoming_msg(contact, "incoming msg", channel=self.channel)
+
+        ChannelLog.objects.create(
+            channel=self.channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url="htpp://example.com",
+            method="POST",
+            request='{"json": "ok"}',
+            response='{"json": "ok"}',
+            response_status=200,
+            created_on=timezone.now() - timedelta(days=7),
+        )
+        l2 = ChannelLog.objects.create(
+            channel=self.channel,
+            msg=msg,
+            description="Successfully Sent",
+            is_error=False,
+            url="htpp://example.com",
+            method="POST",
+            request='{"json": "ok"}',
+            response='{"json": "ok"}',
+            response_status=200,
+            created_on=timezone.now() - timedelta(days=2),
+        )
+
+        trim_channel_log_task()
+
+        # should only have one log remaining and should be l2
+        self.assertEqual(1, ChannelLog.objects.all().count())
+        self.assertTrue(ChannelLog.objects.filter(id=l2.id))
 
 
 class FacebookWhitelistTest(TembaTest):
@@ -2958,7 +2709,7 @@ class FacebookWhitelistTest(TembaTest):
             response = self.client.post(whitelist_url, dict(whitelisted_domain="https://foo.bar"))
 
             mock.assert_called_once_with(
-                "https://graph.facebook.com/v2.12/me/thread_settings?access_token=auth",
+                "https://graph.facebook.com/v3.3/me/thread_settings?access_token=auth",
                 json=dict(
                     setting_type="domain_whitelisting",
                     whitelisted_domains=["https://foo.bar"],
@@ -2970,29 +2721,27 @@ class FacebookWhitelistTest(TembaTest):
 
 
 class CourierTest(TembaTest):
+    @override_settings(SEND_MESSAGES=True)
     def test_queue_to_courier(self):
         self.channel.channel_type = "T"
         self.channel.save()
 
-        bob = self.create_contact("Bob", urn="tel:+12065551111")
-        incoming = self.create_msg(contact=bob, text="Hello", direction="I", external_id="external-id")
+        bob = self.create_contact("Bob", urns=["tel:+12065551111"])
+        cat = self.create_contact("Cat", urns=["tel:+12065552222"])
+        dan = self.create_contact("Dan", urns=["tel:+12065553333"])
+        eve = self.create_contact("eve", urns=["tel:+12065554444"])
+        incoming = self.create_incoming_msg(bob, "Hello", external_id="external-id")
 
         # create some outgoing messages for our channel
-        msg1 = Msg.create_outgoing(
-            self.org,
-            self.admin,
-            "tel:+12065551111",
+        msg1 = self.create_outgoing_msg(
+            bob,
             "Outgoing 1",
             attachments=["image/jpg:https://example.com/test.jpg", "image/jpg:https://example.com/test2.jpg"],
         )
-        msg2 = Msg.create_outgoing(
-            self.org, self.admin, "tel:+12065552222", "Outgoing 2", response_to=incoming, attachments=[]
-        )
-        msg3 = Msg.create_outgoing(
-            self.org, self.admin, "tel:+12065553333", "Outgoing 3", high_priority=False, attachments=None
-        )
-        msg4 = Msg.create_outgoing(self.org, self.admin, "tel:+12065554444", "Outgoing 4", high_priority=True)
-        msg5 = Msg.create_outgoing(self.org, self.admin, "tel:+12065554444", "Outgoing 5", high_priority=True)
+        msg2 = self.create_outgoing_msg(cat, "Outgoing 2", response_to=incoming, attachments=[])
+        msg3 = self.create_outgoing_msg(dan, "Outgoing 3", high_priority=False, attachments=None)
+        msg4 = self.create_outgoing_msg(eve, "Outgoing 4", high_priority=True)
+        msg5 = self.create_outgoing_msg(eve, "Outgoing 5", high_priority=True)
         all_msgs = [msg1, msg2, msg3, msg4, msg5]
 
         Msg.send_messages(all_msgs)
@@ -3000,7 +2749,7 @@ class CourierTest(TembaTest):
         # we should have been queued to our courier queues and our msgs should be marked as such
         for msg in all_msgs:
             msg.refresh_from_db()
-            self.assertEqual(msg.status, QUEUED)
+            self.assertEqual(msg.status, Msg.STATUS_QUEUED)
 
         self.assertFalse(msg1.high_priority)
 
@@ -3032,192 +2781,13 @@ class CourierTest(TembaTest):
             low_priority_msgs[0][0]["attachments"],
             ["image/jpg:https://example.com/test.jpg", "image/jpg:https://example.com/test2.jpg"],
         )
-        self.assertEqual(low_priority_msgs[0][0]["tps_cost"], 2)
-        self.assertIsNone(low_priority_msgs[1][0]["attachments"])
-        self.assertEqual(low_priority_msgs[1][0]["tps_cost"], 1)
-        self.assertEqual(low_priority_msgs[1][0]["response_to_external_id"], "external-id")
+        self.assertEqual(2, low_priority_msgs[0][0]["tps_cost"])
+        self.assertEqual([], low_priority_msgs[1][0]["attachments"])
+        self.assertEqual(1, low_priority_msgs[1][0]["tps_cost"])
+        self.assertEqual("external-id", low_priority_msgs[1][0]["response_to_external_id"])
         self.assertIsNone(low_priority_msgs[2][0]["attachments"])
 
-
-class HandleEventTest(TembaTest):
-    def test_new_conversation_channel_event(self):
-        self.joe = self.create_contact("Joe", "+12065551212")
-        flow = self.get_flow("favorites")
-        Trigger.create(self.org, self.admin, Trigger.TYPE_NEW_CONVERSATION, flow)
-
-        event = ChannelEvent.create(
-            self.channel, "tel:+12065551212", ChannelEvent.TYPE_NEW_CONVERSATION, timezone.now()
-        )
-        push_task(self.org, Queue.HANDLER, HANDLE_EVENT_TASK, dict(type=CHANNEL_EVENT, event_id=event.id))
-
-        # should have been started in our flow
-        self.assertTrue(FlowRun.objects.filter(flow=flow, contact=self.joe))
-
-    def test_stop_contact_channel_event(self):
-        self.joe = self.create_contact("Joe", "+12065551212")
-
-        self.assertFalse(self.joe.is_stopped)
-        event = ChannelEvent.create(self.channel, "tel:+12065551212", ChannelEvent.TYPE_STOP_CONTACT, timezone.now())
-        push_task(self.org, Queue.HANDLER, HANDLE_EVENT_TASK, dict(type=CHANNEL_EVENT, event_id=event.id))
-
-        self.joe.refresh_from_db()
-        self.assertTrue(self.joe.is_stopped)
-
-
-class FacebookTest(TembaTest):
-    def setUp(self):
-        super().setUp()
-
-        self.channel.delete()
-        self.channel = Channel.create(
-            self.org,
-            self.user,
-            None,
-            "FB",
-            None,
-            "1234",
-            config={Channel.CONFIG_AUTH_TOKEN: "auth"},
-            uuid="00000000-0000-0000-0000-000000001234",
-        )
-
-        (self.contact, self.urn) = Contact.get_or_create(org=self.org, urn="facebook:1122", channel=self.channel)
-
-    def tearDown(self):
-        super().tearDown()
-
-    def test_referrals_optin(self):
-        # create two triggers for referrals
-        flow = self.get_flow("favorites")
-        Trigger.objects.create(
-            org=self.org,
-            trigger_type=Trigger.TYPE_REFERRAL,
-            referrer_id="join",
-            flow=flow,
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
-        Trigger.objects.create(
-            org=self.org,
-            trigger_type=Trigger.TYPE_REFERRAL,
-            referrer_id="signup",
-            flow=flow,
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
-
-        event = ChannelEvent.objects.create(
-            org=self.org,
-            channel=self.channel,
-            contact=self.contact,
-            event_type=ChannelEvent.TYPE_REFERRAL,
-            extra={"referrer_id": "join"},
-            occurred_on=timezone.now(),
-        )
-        event.handle()
-
-        # check that the user started the flow
-        contact1 = Contact.objects.get(org=self.org, urns__path="1122")
-        self.assertEqual("What is your favorite color?", contact1.msgs.all().first().text)
-
-    def test_referrals_params(self):
-        # create two triggers for referrals
-        favorites = self.get_flow("favorites")
-        pick = self.get_flow("pick_a_number")
-
-        Trigger.objects.create(
-            org=self.org,
-            trigger_type=Trigger.TYPE_REFERRAL,
-            referrer_id="join",
-            flow=favorites,
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
-
-        event = ChannelEvent.objects.create(
-            org=self.org,
-            channel=self.channel,
-            contact=self.contact,
-            event_type=ChannelEvent.TYPE_REFERRAL,
-            extra={"ad_id": "6798564483757", "source": "ADS", "type": "OPEN_THREAD"},
-            occurred_on=timezone.now(),
-        )
-        event.handle()
-
-        # check that the flow was not started
-        self.assertEqual(0, favorites.runs.all().count())
-
-        Trigger.objects.create(
-            org=self.org,
-            trigger_type=Trigger.TYPE_REFERRAL,
-            referrer_id="signup",
-            flow=favorites,
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
-        Trigger.objects.create(
-            org=self.org,
-            trigger_type=Trigger.TYPE_REFERRAL,
-            referrer_id="",
-            flow=pick,
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
-
-        event = ChannelEvent.objects.create(
-            org=self.org,
-            channel=self.channel,
-            contact=self.contact,
-            event_type=ChannelEvent.TYPE_REFERRAL,
-            extra={"referrer_id": "JOIN", "source": "SHORTLINK", "type": "OPEN_THREAD"},
-            occurred_on=timezone.now(),
-        )
-        event.handle()
-
-        # check that the user started the flow
-        contact1 = Contact.objects.get(org=self.org, urns__path="1122")
-        self.assertEqual("What is your favorite color?", contact1.msgs.order_by("id").last().text)
-
-        event = ChannelEvent.objects.create(
-            org=self.org,
-            channel=self.channel,
-            contact=self.contact,
-            event_type=ChannelEvent.TYPE_REFERRAL,
-            extra={"ad_id": "6798564483757", "source": "ADS", "type": "OPEN_THREAD"},
-            occurred_on=timezone.now(),
-        )
-        event.handle()
-
-        # check that the user started the flow
-        contact1 = Contact.objects.get(org=self.org, urns__path="1122")
-        self.assertEqual("Pick a number between 1-10.", contact1.msgs.order_by("id").last().text)
-
-        event = ChannelEvent.objects.create(
-            org=self.org,
-            channel=self.channel,
-            contact=self.contact,
-            event_type=ChannelEvent.TYPE_REFERRAL,
-            extra={"referrer_id": "not_handled", "source": "SHORTLINK", "type": "OPEN_THREAD"},
-            occurred_on=timezone.now(),
-        )
-        event.handle()
-
-        # check that the user started the flow
-        contact1 = Contact.objects.get(org=self.org, urns__path="1122")
-        self.assertEqual("Pick a number between 1-10.", contact1.msgs.order_by("id").last().text)
-
-        event = ChannelEvent.objects.create(
-            org=self.org,
-            channel=self.channel,
-            contact=self.contact,
-            event_type=ChannelEvent.TYPE_REFERRAL,
-            extra={"referrer_id": "signup", "source": "SHORTLINK", "type": "OPEN_THREAD"},
-            occurred_on=timezone.now(),
-        )
-        event.handle()
-
-        # check that the user started the flow
-        contact1 = Contact.objects.get(org=self.org, urns__path="1122")
-        self.assertEqual("What is your favorite color?", contact1.msgs.all().first().text)
-
-        # and that we created an event for it
-        self.assertTrue(ChannelEvent.objects.filter(contact=contact1, event_type=ChannelEvent.TYPE_REFERRAL))
+    def test_courier_urls(self):
+        response = self.client.get(reverse("courier.t", args=[self.channel.uuid, "receive"]))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.content, b"this URL should be mapped to a Courier instance")

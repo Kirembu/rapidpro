@@ -1,9 +1,9 @@
 import os
 
 from django.conf import settings
+from django.core.files.storage import default_storage
 from django.urls import reverse
-
-from temba.utils.s3 import public_file_storage
+from django.utils.text import slugify
 
 ASSET_STORES_BY_KEY = {}
 ASSET_STORES_BY_MODEL = {}
@@ -58,10 +58,10 @@ class BaseAssetStore(object):
     permission = None
     extensions = None
 
-    def resolve(self, user, pk):
+    def resolve(self, user, pk) -> tuple:
         """
-        Returns a tuple of the org, location and download filename of the identified asset. If user does not have access
-        to the asset, an exception is raised.
+        Returns a tuple of the asset object, location and download filename of the identified asset. If user does not
+        have access to the asset, an exception is raised.
         """
         asset = self.derive_asset(pk)
 
@@ -73,31 +73,24 @@ class BaseAssetStore(object):
 
         path = self.derive_path(asset.org, asset.uuid)
 
-        if not public_file_storage.exists(path):  # pragma: needs cover
+        if not default_storage.exists(path):  # pragma: needs cover
             raise AssetFileNotFound()
 
         # create a more friendly download filename
         remainder, extension = path.rsplit(".", 1)
-        filename = "%s_%s.%s" % (self.key, pk, extension)
+        filename = f"{self.key}_{pk}_{slugify(asset.org.name)}.{extension}"
 
         # if our storage backend is S3
-        if settings.DEFAULT_FILE_STORAGE == "storages.backends.s3boto.S3BotoStorage":  # pragma: needs cover
-            # generate our URL manually so that we can force the download name for the user
-            url = public_file_storage.connection.generate_url(
-                public_file_storage.querystring_expire,
-                method="GET",
-                bucket=public_file_storage.bucket.name,
-                key=public_file_storage._encode_name(path),
-                query_auth=public_file_storage.querystring_auth,
-                force_http=not public_file_storage.secure_urls,
-                response_headers={"response-content-disposition": "attachment;filename=%s" % filename},
+        if settings.DEFAULT_FILE_STORAGE == "storages.backends.s3boto3.S3Boto3Storage":  # pragma: needs cover
+            url = default_storage.url(
+                path, parameters=dict(ResponseContentDisposition=f"attachment;filename={filename}"), http_method="GET"
             )
 
         # otherwise, let the backend generate the URL
         else:
-            url = public_file_storage.url(path)
+            url = default_storage.url(path)
 
-        return asset.org, url, filename
+        return asset, url, filename
 
     def save(self, pk, _file, extension):
         """
@@ -110,7 +103,7 @@ class BaseAssetStore(object):
 
         path = self.derive_path(asset.org, asset.uuid, extension)
 
-        public_file_storage.save(path, _file)
+        default_storage.save(path, _file)
 
     def derive_asset(self, pk):
         """
@@ -136,7 +129,7 @@ class BaseAssetStore(object):
         # no explicit extension so look for one with an existing file
         for ext in extension or self.extensions:
             path = "%s/%s.%s" % (directory, base_name, ext)
-            if public_file_storage.exists(path):
+            if default_storage.exists(path):
                 return path
 
         raise AssetFileNotFound()  # pragma: needs cover

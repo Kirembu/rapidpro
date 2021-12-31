@@ -1,22 +1,39 @@
+import logging
+import numbers
+from collections import OrderedDict
+
 import iso8601
+import pycountry
 import pytz
+import regex
 from rest_framework import serializers
 
+from django.conf import settings
+from django.contrib.auth.models import User
+
+from temba import mailroom
 from temba.api.models import Resthook, ResthookSubscriber, WebHookEvent
-from temba.api.v2.fields import NoNullCharsField
 from temba.archives.models import Archive
-from temba.campaigns.models import Campaign, CampaignEvent, EventFire
+from temba.campaigns.models import Campaign, CampaignEvent
 from temba.channels.models import Channel, ChannelEvent
+from temba.classifiers.models import Classifier
 from temba.contacts.models import Contact, ContactField, ContactGroup
 from temba.flows.models import Flow, FlowRun, FlowStart
+from temba.globals.models import Global
 from temba.locations.models import AdminBoundary
-from temba.msgs.models import PENDING, QUEUED, Broadcast, Label, Msg
-from temba.msgs.tasks import send_broadcast_task
+from temba.mailroom import modifiers
+from temba.msgs.models import Broadcast, Label, Msg
+from temba.orgs.models import Org, OrgRole
+from temba.templates.models import Template, TemplateTranslation
+from temba.tickets.models import Ticket, Ticketer, Topic
 from temba.utils import extract_constants, json, on_transaction_commit
-from temba.values.constants import Value
 
 from . import fields
 from .validators import UniqueForOrgValidator
+
+INVALID_EXTRA_KEY_CHARS = regex.compile(r"[^a-zA-Z0-9_]")
+
+logger = logging.getLogger(__name__)
 
 
 def format_datetime(value):
@@ -24,6 +41,54 @@ def format_datetime(value):
     Datetime fields are formatted with microsecond accuracy for v2
     """
     return json.encode_datetime(value, micros=True) if value else None
+
+
+def normalize_extra(extra):
+    """
+    Normalizes a dict of extra passed to the flow start endpoint. We need to do this for backwards compatibility with
+    old engine.
+    """
+
+    return _normalize_extra(extra, -1)[0]
+
+
+def _normalize_extra(extra, count):
+    def normalize_key(key):
+        return INVALID_EXTRA_KEY_CHARS.sub("_", key)[:255]
+
+    if isinstance(extra, str):
+        return extra[:640], count + 1
+
+    elif isinstance(extra, numbers.Number) or isinstance(extra, bool):
+        return extra, count + 1
+
+    elif isinstance(extra, dict):
+        count += 1
+        normalized = OrderedDict()
+        for (k, v) in extra.items():
+            (normalized[normalize_key(k)], count) = _normalize_extra(v, count)
+
+            if count >= settings.FLOW_START_PARAMS_SIZE:
+                break
+
+        return normalized, count
+
+    elif isinstance(extra, list):
+        count += 1
+        normalized = OrderedDict()
+        for (i, v) in enumerate(extra):
+            (normalized[str(i)], count) = _normalize_extra(v, count)
+
+            if count >= settings.FLOW_START_PARAMS_SIZE:
+                break
+
+        return normalized, count
+
+    elif extra is None:
+        return "", count + 1
+
+    else:  # pragma: no cover
+        raise ValueError("Unsupported type %s in extra" % str(type(extra)))
 
 
 class ReadSerializer(serializers.ModelSerializer):
@@ -47,17 +112,23 @@ class WriteSerializer(serializers.Serializer):
                 detail={"non_field_errors": ["Request body should be a single JSON object"]}
             )
 
-        if self.context["org"].is_suspended():
-            raise serializers.ValidationError(
-                detail={
-                    "non_field_errors": [
-                        "Sorry, your account is currently suspended. "
-                        "To enable sending messages, please contact support."
-                    ]
-                }
-            )
+        if self.context["org"].is_flagged or self.context["org"].is_suspended:
+            msg = Org.BLOCKER_FLAGGED if self.context["org"].is_flagged else Org.BLOCKER_SUSPENDED
+            raise serializers.ValidationError(detail={"non_field_errors": [msg]})
 
         return super().run_validation(data)
+
+
+class BulkActionFailure:
+    """
+    Bulk action serializers can return a partial failure if some objects couldn't be acted on
+    """
+
+    def __init__(self, failures):
+        self.failures = failures
+
+    def as_json(self):
+        return {"failures": self.failures}
 
 
 # ============================================================
@@ -105,21 +176,32 @@ class ArchiveReadSerializer(ReadSerializer):
 
 
 class BroadcastReadSerializer(ReadSerializer):
+    STATUSES = {
+        Broadcast.STATUS_INITIALIZING: "queued",
+        Broadcast.STATUS_QUEUED: "queued",
+        Broadcast.STATUS_SENT: "sent",
+        Broadcast.STATUS_FAILED: "failed",
+    }
+
     text = fields.TranslatableField()
+    status = serializers.SerializerMethodField()
     urns = serializers.SerializerMethodField()
     contacts = fields.ContactField(many=True)
     groups = fields.ContactGroupField(many=True)
     created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
 
+    def get_status(self, obj):
+        return self.STATUSES.get(obj.status, "sent")
+
     def get_urns(self, obj):
         if self.context["org"].is_anon:
             return None
         else:
-            return [str(urn) for urn in obj.urns.all()]
+            return obj.raw_urns or []
 
     class Meta:
         model = Broadcast
-        fields = ("id", "urns", "contacts", "groups", "text", "created_on")
+        fields = ("id", "urns", "contacts", "groups", "text", "status", "created_on")
 
 
 class BroadcastWriteSerializer(WriteSerializer):
@@ -127,7 +209,7 @@ class BroadcastWriteSerializer(WriteSerializer):
     urns = fields.URNListField(required=False)
     contacts = fields.ContactField(many=True, required=False)
     groups = fields.ContactGroupField(many=True, required=False)
-    channel = fields.ChannelField(required=False)
+    ticket = fields.TicketField(required=False)
 
     def validate(self, data):
         if not (data.get("urns") or data.get("contacts") or data.get("groups")):
@@ -139,11 +221,6 @@ class BroadcastWriteSerializer(WriteSerializer):
         """
         Create a new broadcast to send out
         """
-        contact_urns = []
-        for urn in self.validated_data.get("urns", []):
-            # create contacts for URNs if necessary
-            __, contact_urn = Contact.get_or_create(self.context["org"], urn, user=self.context["user"])
-            contact_urns.append(contact_urn)
 
         text, base_language = self.validated_data["text"]
 
@@ -155,12 +232,13 @@ class BroadcastWriteSerializer(WriteSerializer):
             base_language=base_language,
             groups=self.validated_data.get("groups", []),
             contacts=self.validated_data.get("contacts", []),
-            urns=contact_urns,
-            channel=self.validated_data.get("channel"),
+            urns=self.validated_data.get("urns", []),
+            template_state=Broadcast.TEMPLATE_STATE_UNEVALUATED,
+            ticket=self.validated_data.get("ticket"),
         )
 
-        # send in task
-        on_transaction_commit(lambda: send_broadcast_task.delay(broadcast.id))
+        # send it
+        on_transaction_commit(lambda: broadcast.send_async())
 
         return broadcast
 
@@ -264,6 +342,7 @@ class CampaignEventWriteSerializer(WriteSerializer):
     relative_to = fields.ContactFieldField(required=True)
     message = fields.TranslatableField(required=False, max_length=Msg.MAX_TEXT_LEN)
     flow = fields.FlowField(required=False)
+    new_expressions = serializers.BooleanField(required=False, default=False)
 
     def validate_unit(self, value):
         return self.UNITS[value]
@@ -271,12 +350,16 @@ class CampaignEventWriteSerializer(WriteSerializer):
     def validate_campaign(self, value):
         if self.instance and value and self.instance.campaign != value:
             raise serializers.ValidationError("Cannot change campaign for existing events")
-
         return value
 
     def validate(self, data):
         message = data.get("message")
         flow = data.get("flow")
+
+        if message and not flow:
+            translations, base_language = message
+            if not translations[base_language]:
+                raise serializers.ValidationError("Message text is required")
 
         if (message and flow) or (not message and not flow):
             raise serializers.ValidationError("Flow UUID or a message text required.")
@@ -298,7 +381,7 @@ class CampaignEventWriteSerializer(WriteSerializer):
         if self.instance:
 
             # we dont update, we only create
-            self.instance = self.instance.deactivate_and_copy()
+            self.instance = self.instance.recreate()
 
             # we are being set to a flow
             if flow:
@@ -321,7 +404,7 @@ class CampaignEventWriteSerializer(WriteSerializer):
                 # otherwise, we can just update that flow
                 else:
                     # set our single message on our flow
-                    self.instance.flow.update_single_message_flow(translations, base_language)
+                    self.instance.flow.update_single_message_flow(self.context["user"], translations, base_language)
 
             # update our other attributes
             self.instance.offset = offset
@@ -338,6 +421,7 @@ class CampaignEventWriteSerializer(WriteSerializer):
                 )
             else:
                 translations, base_language = message
+
                 self.instance = CampaignEvent.create_message_event(
                     self.context["org"],
                     self.context["user"],
@@ -349,10 +433,11 @@ class CampaignEventWriteSerializer(WriteSerializer):
                     delivery_hour,
                     base_language,
                 )
+
             self.instance.update_flow_name()
 
         # create our event fires for this event in the background
-        EventFire.create_eventfires_for_event(self.instance)
+        self.instance.schedule_async()
 
         return self.instance
 
@@ -367,7 +452,7 @@ class ChannelReadSerializer(ReadSerializer):
         return str(obj.country) if obj.country else None
 
     def get_device(self, obj):
-        if obj.channel_type != Channel.TYPE_ANDROID:
+        if not obj.is_android():
             return None
 
         return {
@@ -383,6 +468,22 @@ class ChannelReadSerializer(ReadSerializer):
         fields = ("uuid", "name", "address", "country", "device", "last_seen", "created_on")
 
 
+class ClassifierReadSerializer(ReadSerializer):
+    type = serializers.SerializerMethodField()
+    intents = serializers.SerializerMethodField()
+    created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+
+    def get_type(self, obj):
+        return obj.classifier_type
+
+    def get_intents(self, obj):
+        return [i.name for i in obj.intents.filter(is_active=True).order_by("name")]
+
+    class Meta:
+        model = Classifier
+        fields = ("uuid", "name", "type", "intents", "created_on")
+
+
 class ContactReadSerializer(ReadSerializer):
     name = serializers.SerializerMethodField()
     language = serializers.SerializerMethodField()
@@ -393,6 +494,7 @@ class ContactReadSerializer(ReadSerializer):
     stopped = serializers.SerializerMethodField()
     created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
     modified_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+    last_seen_on = serializers.DateTimeField(default_timezone=pytz.UTC)
 
     def get_name(self, obj):
         return obj.name if obj.is_active else None
@@ -401,10 +503,10 @@ class ContactReadSerializer(ReadSerializer):
         return obj.language if obj.is_active else None
 
     def get_urns(self, obj):
-        if self.context["org"].is_anon or not obj.is_active:
+        if not obj.is_active:
             return []
 
-        return [str(urn) for urn in obj.get_urns()]
+        return [urn.api_urn() for urn in obj.get_urns()]
 
     def get_groups(self, obj):
         if not obj.is_active:
@@ -423,10 +525,10 @@ class ContactReadSerializer(ReadSerializer):
         return fields
 
     def get_blocked(self, obj):
-        return obj.is_blocked if obj.is_active else None
+        return obj.status == Contact.STATUS_BLOCKED if obj.is_active else None
 
     def get_stopped(self, obj):
-        return obj.is_stopped if obj.is_active else None
+        return obj.status == Contact.STATUS_STOPPED if obj.is_active else None
 
     class Meta:
         model = Contact
@@ -441,6 +543,7 @@ class ContactReadSerializer(ReadSerializer):
             "stopped",
             "created_on",
             "modified_on",
+            "last_seen_on",
         )
 
 
@@ -449,26 +552,36 @@ class ContactWriteSerializer(WriteSerializer):
     language = serializers.CharField(required=False, min_length=3, max_length=3, allow_null=True)
     urns = fields.URNListField(required=False)
     groups = fields.ContactGroupField(many=True, required=False, allow_dynamic=False)
-    fields = fields.LimitedDictField(required=False, child=NoNullCharsField())
+    fields = fields.LimitedDictField(required=False, child=serializers.CharField(allow_blank=True, allow_null=True))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def validate_language(self, value):
+        if value and not pycountry.languages.get(alpha_3=value):
+            raise serializers.ValidationError("Not a valid ISO639-3 language code.")
+
+        return value
+
     def validate_groups(self, value):
-        # if contact is blocked, they can't be added to groups
-        if self.instance and (self.instance.is_blocked or self.instance.is_stopped) and value:
-            raise serializers.ValidationError("Blocked or stopped contacts can't be added to groups")
+        # only active contacts can be added to groups
+        if self.instance and (self.instance.status != Contact.STATUS_ACTIVE) and value:
+            raise serializers.ValidationError("Non-active contacts can't be added to groups")
 
         return value
 
     def validate_fields(self, value):
-        valid_keys = {f.key for f in self.context["contact_fields"]}
+        fields_by_key = {f.key: f for f in self.context["contact_fields"]}
+        values_by_field = {}
 
         for field_key, field_val in value.items():
-            if field_key not in valid_keys:
+            field_obj = fields_by_key.get(field_key)
+            if not field_obj:
                 raise serializers.ValidationError(f"Invalid contact field key: {field_key}")
 
-        return value
+            values_by_field[field_obj] = field_val
+
+        return values_by_field
 
     def validate_urns(self, value):
         org = self.context["org"]
@@ -494,7 +607,7 @@ class ContactWriteSerializer(WriteSerializer):
             raise serializers.ValidationError("Inactive contacts can't be modified.")
 
         # we allow creation of contacts by URN used for lookup
-        if not data.get("urns") and "urns__identity" in self.context["lookup_values"]:
+        if not data.get("urns") and "urns__identity" in self.context["lookup_values"] and not self.instance:
             url_urn = self.context["lookup_values"]["urns__identity"]
 
             data["urns"] = [fields.validate_urn(url_urn)]
@@ -511,54 +624,71 @@ class ContactWriteSerializer(WriteSerializer):
         groups = self.validated_data.get("groups")
         custom_fields = self.validated_data.get("fields")
 
-        changed = []
+        mods = []
 
+        # update an existing contact
         if self.instance:
             # update our name and language
             if "name" in self.validated_data and name != self.instance.name:
-                self.instance.name = name
-                changed.append("name")
+                mods.append(modifiers.Name(name=name))
             if "language" in self.validated_data and language != self.instance.language:
-                self.instance.language = language
-                changed.append("language")
-
-            if changed:
-                self.instance.save(update_fields=changed, handle_update=True)
+                mods.append(modifiers.Language(language=language))
 
             if "urns" in self.validated_data and urns is not None:
-                self.instance.update_urns(self.context["user"], urns)
+                mods += self.instance.update_urns(urns)
 
+            # update our fields
+            if custom_fields is not None:
+                mods += self.instance.update_fields(values=custom_fields)
+
+            # update our groups
+            if groups is not None:
+                mods += self.instance.update_static_groups(groups)
+
+            if mods:
+                self.instance.modify(self.context["user"], mods)
+
+        # create new contact
         else:
-            self.instance = Contact.get_or_create_by_urns(
-                self.context["org"], self.context["user"], name, urns=urns, language=language
+            self.instance = Contact.create(
+                self.context["org"],
+                self.context["user"],
+                name,
+                language,
+                urns or [],
+                custom_fields or {},
+                groups or [],
             )
-
-        # update our fields
-        if custom_fields is not None:
-            self.instance.set_fields(user=self.context["user"], fields=custom_fields)
-
-        # update our groups
-        if groups is not None:
-            self.instance.update_static_groups(self.context["user"], groups)
 
         return self.instance
 
 
 class ContactFieldReadSerializer(ReadSerializer):
-    VALUE_TYPES = extract_constants(Value.TYPE_CONFIG)
+    VALUE_TYPES = {
+        ContactField.TYPE_TEXT: "text",
+        ContactField.TYPE_NUMBER: "numeric",
+        ContactField.TYPE_DATETIME: "datetime",
+        ContactField.TYPE_STATE: "state",
+        ContactField.TYPE_DISTRICT: "district",
+        ContactField.TYPE_WARD: "ward",
+    }
 
     value_type = serializers.SerializerMethodField()
+    pinned = serializers.SerializerMethodField()
 
     def get_value_type(self, obj):
-        return self.VALUE_TYPES.get(obj.value_type)
+        return self.VALUE_TYPES[obj.value_type]
+
+    def get_pinned(self, obj):
+        return obj.show_in_table
 
     class Meta:
         model = ContactField
-        fields = ("key", "label", "value_type")
+        fields = ("key", "label", "value_type", "pinned")
 
 
 class ContactFieldWriteSerializer(WriteSerializer):
-    VALUE_TYPES = extract_constants(Value.TYPE_CONFIG, reverse=True)
+    VALUE_TYPES = {v: k for k, v in ContactFieldReadSerializer.VALUE_TYPES.items()}
 
     label = serializers.CharField(
         required=True,
@@ -578,16 +708,18 @@ class ContactFieldWriteSerializer(WriteSerializer):
         return value
 
     def validate_value_type(self, value):
-        return self.VALUE_TYPES.get(value)
+        return self.VALUE_TYPES[value]
 
     def validate(self, data):
+        org = self.context["org"]
+        org_active_fields_limit = org.get_limit(Org.LIMIT_FIELDS)
 
-        fields_count = ContactField.user_fields.filter(org=self.context["org"]).count()
-        if not self.instance and fields_count >= ContactField.MAX_ORG_CONTACTFIELDS:
+        field_count = ContactField.user_fields.count_active_for_org(org=org)
+        if not self.instance and field_count >= org_active_fields_limit:
             raise serializers.ValidationError(
                 "This org has %s contact fields and the limit is %s. "
                 "You must delete existing ones before you can "
-                "create new ones." % (fields_count, ContactField.MAX_ORG_CONTACTFIELDS)
+                "create new ones." % (field_count, org_active_fields_limit)
             )
 
         return data
@@ -635,12 +767,15 @@ class ContactGroupWriteSerializer(WriteSerializer):
         return value
 
     def validate(self, data):
+        org = self.context["org"]
+        org_active_groups_limit = org.get_limit(Org.LIMIT_GROUPS)
+
         group_count = ContactGroup.user_groups.filter(org=self.context["org"]).count()
-        if group_count >= ContactGroup.MAX_ORG_CONTACTGROUPS:
+        if group_count >= org_active_groups_limit:
             raise serializers.ValidationError(
                 "This org has %s groups and the limit is %s. "
                 "You must delete existing ones before you can "
-                "create new ones." % (group_count, ContactGroup.MAX_ORG_CONTACTGROUPS)
+                "create new ones." % (group_count, org_active_groups_limit)
             )
         return data
 
@@ -661,15 +796,21 @@ class ContactBulkActionSerializer(WriteSerializer):
     BLOCK = "block"
     UNBLOCK = "unblock"
     INTERRUPT = "interrupt"
-    ARCHIVE = "archive"
+    ARCHIVE_MESSAGES = "archive_messages"
     DELETE = "delete"
+    ARCHIVE = "archive"  # backward compatibility
 
-    ACTIONS = (ADD, REMOVE, BLOCK, UNBLOCK, INTERRUPT, ARCHIVE, DELETE)
+    ACTIONS = (ADD, REMOVE, BLOCK, UNBLOCK, INTERRUPT, ARCHIVE_MESSAGES, DELETE, ARCHIVE)
     ACTIONS_WITH_GROUP = (ADD, REMOVE)
 
     contacts = fields.ContactField(many=True)
     action = serializers.ChoiceField(required=True, choices=ACTIONS)
     group = fields.ContactGroupField(required=False, allow_dynamic=False)
+
+    def validate_contacts(self, value):
+        if not value:
+            raise serializers.ValidationError("Contacts can't be empty.")
+        return value
 
     def validate(self, data):
         contacts = data["contacts"]
@@ -682,11 +823,11 @@ class ContactBulkActionSerializer(WriteSerializer):
             raise serializers.ValidationError('For action "%s" you should not specify a group' % action)
 
         if action == self.ADD:
-            # if adding to a group, check for blocked contacts
-            invalid_uuids = {c.uuid for c in contacts if c.is_blocked or c.is_stopped}
+            # if adding to a group, check for non-active contacts
+            invalid_uuids = {c.uuid for c in contacts if c.status != Contact.STATUS_ACTIVE}
             if invalid_uuids:
                 raise serializers.ValidationError(
-                    "Blocked or stopped contacts cannot be added to groups: %s" % ", ".join(invalid_uuids)
+                    "Non-active contacts cannot be added to groups: %s" % ", ".join(invalid_uuids)
                 )
 
         return data
@@ -698,28 +839,27 @@ class ContactBulkActionSerializer(WriteSerializer):
         group = self.validated_data.get("group")
 
         if action == self.ADD:
-            group.update_contacts(user, contacts, add=True)
+            Contact.bulk_change_group(user, contacts, group, add=True)
         elif action == self.REMOVE:
-            group.update_contacts(user, contacts, add=False)
+            Contact.bulk_change_group(user, contacts, group, add=False)
         elif action == self.INTERRUPT:
-            FlowRun.exit_all_for_contacts(contacts, FlowRun.EXIT_TYPE_INTERRUPTED)
-        elif action == self.ARCHIVE:
+            mailroom.queue_interrupt(self.context["org"], contacts=contacts)
+        elif action == self.ARCHIVE_MESSAGES or action == self.ARCHIVE:
             Msg.archive_all_for_contacts(contacts)
-        else:
+        elif action == self.BLOCK:
+            Contact.bulk_change_status(user, contacts, modifiers.Status.BLOCKED)
+        elif action == self.UNBLOCK:
+            Contact.bulk_change_status(user, contacts, modifiers.Status.ACTIVE)
+        elif action == self.DELETE:
             for contact in contacts:
-                if action == self.BLOCK:
-                    contact.block(user)
-                elif action == self.UNBLOCK:
-                    contact.unblock(user)
-                elif action == self.DELETE:
-                    contact.release(user)
+                contact.release(user)
 
 
 class FlowReadSerializer(ReadSerializer):
     FLOW_TYPES = {
         Flow.TYPE_MESSAGE: "message",
         Flow.TYPE_VOICE: "voice",
-        Flow.TYPE_USSD: "ussd",
+        Flow.TYPE_BACKGROUND: "background",
         Flow.TYPE_SURVEY: "survey",
     }
 
@@ -728,6 +868,8 @@ class FlowReadSerializer(ReadSerializer):
     labels = serializers.SerializerMethodField()
     expires = serializers.ReadOnlyField(source="expires_after_minutes")
     runs = serializers.SerializerMethodField()
+    results = serializers.SerializerMethodField()
+    parent_refs = serializers.SerializerMethodField()
     created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
     modified_on = serializers.DateTimeField(default_timezone=pytz.UTC)
 
@@ -746,20 +888,39 @@ class FlowReadSerializer(ReadSerializer):
             "expired": stats["expired"],
         }
 
+    def get_results(self, obj):
+        return obj.metadata.get(Flow.METADATA_RESULTS, [])
+
+    def get_parent_refs(self, obj):
+        return obj.metadata.get(Flow.METADATA_PARENT_REFS, [])
+
     class Meta:
         model = Flow
-        fields = ("uuid", "name", "type", "archived", "labels", "expires", "runs", "created_on", "modified_on")
+        fields = (
+            "uuid",
+            "name",
+            "type",
+            "archived",
+            "labels",
+            "expires",
+            "runs",
+            "results",
+            "parent_refs",
+            "created_on",
+            "modified_on",
+        )
 
 
 class FlowRunReadSerializer(ReadSerializer):
     EXIT_TYPES = {
-        FlowRun.EXIT_TYPE_COMPLETED: "completed",
-        FlowRun.EXIT_TYPE_INTERRUPTED: "interrupted",
-        FlowRun.EXIT_TYPE_EXPIRED: "expired",
+        FlowRun.STATUS_COMPLETED: "completed",
+        FlowRun.STATUS_INTERRUPTED: "interrupted",
+        FlowRun.STATUS_EXPIRED: "expired",
+        FlowRun.STATUS_FAILED: "failed",
     }
 
     flow = fields.FlowField()
-    contact = fields.ContactField()
+    contact = fields.ContactField(with_urn=True)
     start = serializers.SerializerMethodField()
     path = serializers.SerializerMethodField()
     values = serializers.SerializerMethodField()
@@ -783,7 +944,7 @@ class FlowRunReadSerializer(ReadSerializer):
             created_on = iso8601.parse_date(result[FlowRun.RESULT_CREATED_ON])
             return {
                 "value": result[FlowRun.RESULT_VALUE],
-                "category": result[FlowRun.RESULT_CATEGORY],
+                "category": result.get(FlowRun.RESULT_CATEGORY),
                 "node": result[FlowRun.RESULT_NODE_UUID],
                 "time": format_datetime(created_on),
                 "input": result.get(FlowRun.RESULT_INPUT),
@@ -793,7 +954,7 @@ class FlowRunReadSerializer(ReadSerializer):
         return {k: convert_result(r) for k, r in obj.results.items()}
 
     def get_exit_type(self, obj):
-        return self.EXIT_TYPES.get(obj.exit_type)
+        return self.EXIT_TYPES.get(obj.status)
 
     class Meta:
         model = FlowRun
@@ -825,12 +986,17 @@ class FlowStartReadSerializer(ReadSerializer):
     status = serializers.SerializerMethodField()
     groups = fields.ContactGroupField(many=True)
     contacts = fields.ContactField(many=True)
+    exclude_active = serializers.SerializerMethodField()
     extra = serializers.JSONField(required=False)
+    params = serializers.JSONField(required=False, source="extra")
     created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
     modified_on = serializers.DateTimeField(default_timezone=pytz.UTC)
 
     def get_status(self, obj):
         return FlowStartReadSerializer.STATUSES.get(obj.status)
+
+    def get_exclude_active(self, obj):
+        return not obj.include_active
 
     class Meta:
         model = FlowStart
@@ -842,7 +1008,9 @@ class FlowStartReadSerializer(ReadSerializer):
             "groups",
             "contacts",
             "restart_participants",
+            "exclude_active",
             "extra",
+            "params",
             "created_on",
             "modified_on",
         )
@@ -854,18 +1022,20 @@ class FlowStartWriteSerializer(WriteSerializer):
     groups = fields.ContactGroupField(many=True, required=False)
     urns = fields.URNListField(required=False)
     restart_participants = serializers.BooleanField(required=False)
+    exclude_active = serializers.BooleanField(required=False)
     extra = serializers.JSONField(required=False)
+    params = serializers.JSONField(required=False)
 
     def validate_extra(self, value):
         # request is parsed by DRF.JSONParser, and if extra is a valid json it gets deserialized as dict
         # in any other case we need to raise a ValidationError
         if not isinstance(value, dict):
-            raise serializers.ValidationError("Must be a valid JSON value")
+            raise serializers.ValidationError("Must be a valid JSON object")
 
-        if not value:  # pragma: needs cover
-            return None
-        else:
-            return FlowRun.normalize_fields(value)[0]
+        return normalize_extra(value)
+
+    def validate_params(self, value):
+        return self.validate_extra(value)
 
     def validate(self, data):
         # need at least one of urns, groups or contacts
@@ -880,22 +1050,76 @@ class FlowStartWriteSerializer(WriteSerializer):
         contacts = self.validated_data.get("contacts", [])
         groups = self.validated_data.get("groups", [])
         restart_participants = self.validated_data.get("restart_participants", True)
+        exclude_active = self.validated_data.get("exclude_active", False)
         extra = self.validated_data.get("extra")
 
-        # convert URNs to contacts
-        for urn in urns:
-            contact, urn_obj = Contact.get_or_create(self.context["org"], urn, user=self.context["user"])
-            contacts.append(contact)
+        params = self.validated_data.get("params")
+        if params:
+            extra = params
 
         # ok, let's go create our flow start, the actual starting will happen in our view
         return FlowStart.create(
             self.validated_data["flow"],
             self.context["user"],
+            start_type=FlowStart.TYPE_API_ZAPIER if self.context["is_zapier"] else FlowStart.TYPE_API,
             restart_participants=restart_participants,
+            include_active=not exclude_active,
             contacts=contacts,
             groups=groups,
+            urns=urns,
             extra=extra,
         )
+
+
+class GlobalReadSerializer(ReadSerializer):
+    modified_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+
+    class Meta:
+        model = Global
+        fields = ("key", "name", "value", "modified_on")
+
+
+class GlobalWriteSerializer(WriteSerializer):
+    value = serializers.CharField(required=True, max_length=Global.MAX_VALUE_LEN)
+    name = serializers.CharField(
+        required=False,
+        max_length=Global.MAX_NAME_LEN,
+        validators=[UniqueForOrgValidator(queryset=Global.objects.filter(is_active=True), ignore_case=True)],
+    )
+
+    def validate_name(self, value):
+        if not Global.is_valid_name(value):
+            raise serializers.ValidationError("Name contains illegal characters.")
+        key = Global.make_key(value)
+        if not Global.is_valid_key(key):
+            raise serializers.ValidationError("Name creates Key that is invalid")
+        return value
+
+    def validate(self, data):
+        if not self.instance and not data.get("name"):
+            raise serializers.ValidationError("Name is required when creating new global.")
+
+        org = self.context["org"]
+        globals_count = Global.objects.filter(org=org, is_active=True).count()
+        org_active_globals_limit = org.get_limit(Org.LIMIT_GLOBALS)
+
+        if globals_count >= org_active_globals_limit:
+            raise serializers.ValidationError(
+                "This org has %s globals and the limit is %s. You must delete existing ones before you can "
+                "create new ones." % (globals_count, org_active_globals_limit)
+            )
+        return data
+
+    def save(self):
+        value = self.validated_data["value"]
+        if self.instance:
+            self.instance.value = value
+            self.instance.save(update_fields=("value", "modified_on"))
+            return self.instance
+        else:
+            name = self.validated_data["name"]
+            key = Global.make_key(name)
+            return Global.get_or_create(self.context["org"], self.context["user"], key, name, value)
 
 
 class LabelReadSerializer(ReadSerializer):
@@ -923,13 +1147,15 @@ class LabelWriteSerializer(WriteSerializer):
         return value
 
     def validate(self, data):
-        labels_count = Label.label_objects.filter(org=self.context["org"], is_active=True).count()
-        if labels_count >= Label.MAX_ORG_LABELS:
+        org = self.context["org"]
+
+        count = Label.label_objects.filter(org=org, is_active=True).count()
+        if count >= org.get_limit(Org.LIMIT_LABELS):
             raise serializers.ValidationError(
-                "This org has %s labels and the limit is %s. "
-                "You must delete existing ones before you can "
-                "create new ones." % (labels_count, Label.MAX_ORG_LABELS)
+                "This workspace has %d labels and the limit is %d. You must delete existing ones before you can "
+                "create new ones." % (count, org.get_limit(Org.LIMIT_LABELS))
             )
+
         return data
 
     def save(self):
@@ -944,6 +1170,24 @@ class LabelWriteSerializer(WriteSerializer):
 
 
 class MsgReadSerializer(ReadSerializer):
+    STATUSES = {
+        Msg.STATUS_INITIALIZING: "initializing",
+        Msg.STATUS_PENDING: "queued",  # same as far as users are concerned
+        Msg.STATUS_QUEUED: "queued",
+        Msg.STATUS_WIRED: "wired",
+        Msg.STATUS_SENT: "sent",
+        Msg.STATUS_DELIVERED: "delivered",
+        Msg.STATUS_HANDLED: "handled",
+        Msg.STATUS_ERRORED: "errored",
+        Msg.STATUS_FAILED: "failed",
+        Msg.STATUS_RESENT: "resent",
+    }
+    TYPES = {Msg.TYPE_INBOX: "inbox", Msg.TYPE_FLOW: "flow", Msg.TYPE_IVR: "ivr"}
+    VISIBILITIES = {
+        Msg.VISIBILITY_VISIBLE: "visible",
+        Msg.VISIBILITY_ARCHIVED: "archived",
+        Msg.VISIBILITY_DELETED: "deleted",
+    }
 
     broadcast = serializers.SerializerMethodField()
     contact = fields.ContactField()
@@ -965,14 +1209,13 @@ class MsgReadSerializer(ReadSerializer):
         return obj.broadcast_id
 
     def get_direction(self, obj):
-        return Msg.DIRECTIONS.get(obj.direction)
+        return "in" if obj.direction == Msg.DIRECTION_IN else "out"
 
     def get_type(self, obj):
-        return Msg.MSG_TYPES.get(obj.msg_type)
+        return self.TYPES.get(obj.msg_type)
 
     def get_status(self, obj):
-        # PENDING and QUEUED are same as far as users are concerned
-        return Msg.STATUSES.get(QUEUED if obj.status == PENDING else obj.status)
+        return self.STATUSES.get(obj.status)
 
     def get_attachments(self, obj):
         return [a.as_json() for a in obj.get_attachments()]
@@ -984,7 +1227,7 @@ class MsgReadSerializer(ReadSerializer):
         return obj.visibility == Msg.VISIBILITY_ARCHIVED
 
     def get_visibility(self, obj):
-        return Msg.VISIBILITIES.get(obj.visibility)
+        return self.VISIBILITIES.get(obj.visibility)
 
     class Meta:
         model = Msg
@@ -1026,7 +1269,7 @@ class MsgBulkActionSerializer(WriteSerializer):
 
     def validate_messages(self, value):
         for msg in value:
-            if msg.direction != "I":
+            if msg and msg.direction != "I":
                 raise serializers.ValidationError("Not an incoming message: %d" % msg.id)
 
         return value
@@ -1052,10 +1295,21 @@ class MsgBulkActionSerializer(WriteSerializer):
         return data
 
     def save(self):
-        messages = self.validated_data["messages"]
         action = self.validated_data["action"]
         label = self.validated_data.get("label")
         label_name = self.validated_data.get("label_name")
+
+        requested_message_ids = self.initial_data["messages"]
+        requested_messages = self.validated_data["messages"]
+
+        # requested_messages contains nones where msg no longer exists so compile lists of real messages and missing ids
+        messages = []
+        missing_message_ids = []
+        for m, msg in enumerate(requested_messages):
+            if msg is not None:
+                messages.append(msg)
+            else:
+                missing_message_ids.append(requested_message_ids[m])
 
         if action == self.LABEL:
             if not label:
@@ -1076,6 +1330,8 @@ class MsgBulkActionSerializer(WriteSerializer):
                     msg.restore()
                 elif action == self.DELETE:
                     msg.release()
+
+        return BulkActionFailure(missing_message_ids) if missing_message_ids else None
 
 
 class ResthookReadSerializer(ReadSerializer):
@@ -1145,3 +1401,228 @@ class WebHookEventReadSerializer(ReadSerializer):
     class Meta:
         model = WebHookEvent
         fields = ("resthook", "data", "created_on")
+
+
+class TemplateReadSerializer(ReadSerializer):
+    translations = serializers.SerializerMethodField()
+    modified_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+    created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+
+    def get_translations(self, obj):
+        translations = []
+        for translation in (
+            TemplateTranslation.objects.filter(template=obj, is_active=True)
+            .order_by("language")
+            .select_related("channel")
+        ):
+            translations.append(
+                {
+                    "language": translation.language,
+                    "content": translation.content,
+                    "namespace": translation.namespace,
+                    "variable_count": translation.variable_count,
+                    "status": translation.get_status_display(),
+                    "channel": {"uuid": translation.channel.uuid, "name": translation.channel.name},
+                }
+            )
+
+        return translations
+
+    class Meta:
+        model = Template
+        fields = ("uuid", "name", "translations", "created_on", "modified_on")
+
+
+class TicketerReadSerializer(ReadSerializer):
+    type = serializers.SerializerMethodField()
+    created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+
+    def get_type(self, obj):
+        return obj.ticketer_type
+
+    class Meta:
+        model = Ticketer
+        fields = ("uuid", "name", "type", "created_on")
+
+
+class TicketReadSerializer(ReadSerializer):
+    STATUSES = {Ticket.STATUS_OPEN: "open", Ticket.STATUS_CLOSED: "closed"}
+
+    ticketer = fields.TicketerField()
+    contact = fields.ContactField()
+    status = serializers.SerializerMethodField()
+    topic = fields.TopicField()
+    assignee = fields.UserField()
+    opened_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+    closed_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+
+    def get_status(self, obj):
+        return self.STATUSES.get(obj.status)
+
+    class Meta:
+        model = Ticket
+        fields = ("uuid", "ticketer", "contact", "status", "topic", "body", "assignee", "opened_on", "closed_on")
+
+
+class TicketBulkActionSerializer(WriteSerializer):
+    ACTION_ASSIGN = "assign"
+    ACTION_ADD_NOTE = "add_note"
+    ACTION_CHANGE_TOPIC = "change_topic"
+    ACTION_CLOSE = "close"
+    ACTION_REOPEN = "reopen"
+    ACTION_CHOICES = (ACTION_ASSIGN, ACTION_ADD_NOTE, ACTION_CHANGE_TOPIC, ACTION_CLOSE, ACTION_REOPEN)
+
+    tickets = fields.TicketField(many=True)
+    action = serializers.ChoiceField(required=True, choices=ACTION_CHOICES)
+    assignee = fields.UserField(required=False, allow_null=True, assignable_only=True)
+    topic = fields.TopicField(required=False)
+    note = serializers.CharField(required=False, max_length=Ticket.MAX_NOTE_LEN)
+
+    def validate(self, data):
+        action = data["action"]
+
+        if action == self.ACTION_ASSIGN and "assignee" not in data:
+            raise serializers.ValidationError('For action "%s" you must specify the assignee' % action)
+        elif action == self.ACTION_ADD_NOTE and not data.get("note"):
+            raise serializers.ValidationError('For action "%s" you must specify the note' % action)
+        elif action == self.ACTION_CHANGE_TOPIC and not data.get("topic"):
+            raise serializers.ValidationError('For action "%s" you must specify the topic' % action)
+
+        return data
+
+    def save(self):
+        org = self.context["org"]
+        user = self.context["user"]
+        tickets = self.validated_data["tickets"]
+        action = self.validated_data["action"]
+        assignee = self.validated_data.get("assignee")
+        note = self.validated_data.get("note")
+        topic = self.validated_data.get("topic")
+
+        if action == self.ACTION_ASSIGN:
+            Ticket.bulk_assign(org, user, tickets, assignee=assignee, note=note)
+        elif action == self.ACTION_ADD_NOTE:
+            Ticket.bulk_add_note(org, user, tickets, note=note)
+        elif action == self.ACTION_CHANGE_TOPIC:
+            Ticket.bulk_change_topic(org, user, tickets, topic=topic)
+        elif action == self.ACTION_CLOSE:
+            Ticket.bulk_close(org, user, tickets)
+        elif action == self.ACTION_REOPEN:
+            Ticket.bulk_reopen(org, user, tickets)
+
+
+class TopicReadSerializer(ReadSerializer):
+    created_on = serializers.DateTimeField(default_timezone=pytz.UTC)
+
+    class Meta:
+        model = Topic
+        fields = ("uuid", "name", "created_on")
+
+
+class TopicWriteSerializer(WriteSerializer):
+    name = serializers.CharField(
+        required=True,
+        max_length=Topic.MAX_NAME_LEN,
+        validators=[UniqueForOrgValidator(queryset=Topic.objects.filter(is_active=True), ignore_case=True)],
+    )
+
+    def validate_name(self, value):
+        if not Topic.is_valid_name(value):
+            raise serializers.ValidationError("Contains illegal characters.")
+        return value
+
+    def validate(self, data):
+        org = self.context["org"]
+
+        if self.instance and self.instance == org.default_ticket_topic:
+            raise serializers.ValidationError("Can't modify default topic for a workspace.")
+
+        count = org.topics.filter(is_active=True).count()
+        if count >= org.get_limit(Org.LIMIT_TOPICS):
+            raise serializers.ValidationError(
+                "This workspace has %s topics and the limit is %s. You must delete existing ones before you can "
+                "create new ones." % (count, org.get_limit(Org.LIMIT_TOPICS))
+            )
+        return data
+
+    def save(self):
+        name = self.validated_data["name"]
+
+        if self.instance:
+            self.instance.name = name
+            self.instance.save(update_fields=("name",))
+            return self.instance
+        else:
+            return Topic.get_or_create(self.context["org"], self.context["user"], name)
+
+
+class UserReadSerializer(ReadSerializer):
+    ROLES = {
+        OrgRole.ADMINISTRATOR: "administrator",
+        OrgRole.EDITOR: "editor",
+        OrgRole.VIEWER: "viewer",
+        OrgRole.AGENT: "agent",
+        OrgRole.SURVEYOR: "surveyor",
+    }
+
+    role = serializers.SerializerMethodField()
+    created_on = serializers.DateTimeField(default_timezone=pytz.UTC, source="date_joined")
+
+    def get_role(self, obj):
+        role = self.context["user_roles"][obj]
+        return self.ROLES[role]
+
+    class Meta:
+        model = User
+        fields = ("email", "first_name", "last_name", "role", "created_on")
+
+
+class WorkspaceReadSerializer(ReadSerializer):
+    DATE_STYLES = {
+        Org.DATE_FORMAT_DAY_FIRST: "day_first",
+        Org.DATE_FORMAT_MONTH_FIRST: "month_first",
+        Org.DATE_FORMAT_YEAR_FIRST: "year_first",
+    }
+
+    country = serializers.SerializerMethodField()
+    languages = serializers.SerializerMethodField()
+    primary_language = serializers.SerializerMethodField()
+    timezone = serializers.SerializerMethodField()
+    date_style = serializers.SerializerMethodField()
+    credits = serializers.SerializerMethodField()
+    anon = serializers.SerializerMethodField()
+
+    def get_country(self, obj):
+        return obj.default_country_code
+
+    def get_languages(self, obj):
+        return obj.flow_languages
+
+    def get_primary_language(self, obj):
+        return obj.flow_languages[0] if obj.flow_languages else None
+
+    def get_timezone(self, obj):
+        return str(obj.timezone)
+
+    def get_date_style(self, obj):
+        return self.DATE_STYLES.get(obj.date_format)
+
+    def get_credits(self, obj):
+        return {"used": obj.get_credits_used(), "remaining": obj.get_credits_remaining()}
+
+    def get_anon(self, obj):
+        return obj.is_anon
+
+    class Meta:
+        model = Org
+        fields = (
+            "uuid",
+            "name",
+            "country",
+            "languages",
+            "primary_language",
+            "timezone",
+            "date_style",
+            "credits",
+            "anon",
+        )
